@@ -10,7 +10,7 @@ use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, ListArray};
 use arrow_schema::DataType;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
@@ -90,36 +90,59 @@ impl ScalarUDFImpl for DistanceUDF {
         };
         let query_vec: Vec<f32> = extract_query_vec(&cols[1])?;
 
-        let fsl = vec_col
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "{}: arg0 must be FixedSizeListArray, got {:?}",
-                    self.name,
-                    vec_col.data_type()
-                ))
-            })?;
-
         let kernel = self.kernel;
-        let mut distances = Vec::with_capacity(fsl.len());
-        for i in 0..fsl.len() {
-            if fsl.is_null(i) {
-                distances.push(None);
-                continue;
-            }
-            let row = fsl.value(i);
-            let row_f32 = row.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "{}: inner array must be Float32Array",
-                    self.name
-                ))
-            })?;
-            distances.push(Some(kernel(row_f32.values(), &query_vec)));
-        }
+        let name = &self.name;
+        let distances = compute_distances(&vec_col, &query_vec, kernel, name)?;
 
         Ok(ColumnarValue::Array(Arc::new(Float32Array::from(distances))))
     }
+}
+
+/// Compute per-row distances from a vector column (FixedSizeList or List) and a query slice.
+fn compute_distances(
+    vec_col: &dyn Array,
+    query_vec: &[f32],
+    kernel: Kernel,
+    udf_name: &str,
+) -> Result<Vec<Option<f32>>> {
+    // FixedSizeListArray — typical for DuckDB FLOAT[N] or pre-cast columns
+    if let Some(fsl) = vec_col.as_any().downcast_ref::<FixedSizeListArray>() {
+        let mut out = Vec::with_capacity(fsl.len());
+        for i in 0..fsl.len() {
+            if fsl.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let row = fsl.value(i);
+            let f32s = row.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
+                DataFusionError::Execution(format!("{udf_name}: inner array must be Float32Array"))
+            })?;
+            out.push(Some(kernel(f32s.values(), query_vec)));
+        }
+        return Ok(out);
+    }
+
+    // ListArray — variable-length, e.g. PostgreSQL real[] / float8[]
+    if let Some(lst) = vec_col.as_any().downcast_ref::<ListArray>() {
+        let mut out = Vec::with_capacity(lst.len());
+        for i in 0..lst.len() {
+            if lst.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let row = lst.value(i);
+            let f32s = row.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
+                DataFusionError::Execution(format!("{udf_name}: inner array must be Float32Array"))
+            })?;
+            out.push(Some(kernel(f32s.values(), query_vec)));
+        }
+        return Ok(out);
+    }
+
+    Err(DataFusionError::Execution(format!(
+        "{udf_name}: arg0 must be FixedSizeList or List(Float32), got {:?}",
+        vec_col.data_type()
+    )))
 }
 
 fn extract_query_vec(val: &ColumnarValue) -> Result<Vec<f32>> {
