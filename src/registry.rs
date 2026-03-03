@@ -1,7 +1,7 @@
 // registry.rs — USearchRegistry, USearchTableConfig, USearchIndexConfig.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result;
@@ -182,12 +182,12 @@ pub struct RegisteredTable {
 // ── USearchRegistry ───────────────────────────────────────────────────────────
 
 pub struct USearchRegistry {
-    tables: HashMap<String, RegisteredTable>,
+    tables: RwLock<HashMap<String, Arc<RegisteredTable>>>,
 }
 
 impl USearchRegistry {
     pub fn new() -> Self {
-        Self { tables: HashMap::new() }
+        Self { tables: RwLock::new(HashMap::new()) }
     }
 
     /// Register a USearch index with default query configuration.
@@ -207,7 +207,7 @@ impl USearchRegistry {
     /// [`add_with_config`]: USearchRegistry::add_with_config
     /// [`HashKeyProvider`]: crate::lookup::HashKeyProvider
     pub fn add(
-        &mut self,
+        &self,
         name: &str,
         index: Arc<Index>,
         provider: Arc<dyn PointLookupProvider>,
@@ -222,7 +222,7 @@ impl USearchRegistry {
     /// Sets `ef_search` on the index exactly once before storing it.
     /// Do not call `index.change_expansion_search()` after this point.
     pub fn add_with_config(
-        &mut self,
+        &self,
         name: &str,
         index: Arc<Index>,
         provider: Arc<dyn PointLookupProvider>,
@@ -246,15 +246,43 @@ impl USearchRegistry {
         fields.push(Field::new("_distance", DataType::Float32, true));
         let schema = Arc::new(Schema::new(fields));
 
-        self.tables.insert(
-            name.to_string(),
-            RegisteredTable { index, provider, key_col: key_col.to_string(), metric, schema, config },
-        );
+        self.tables
+            .write()
+            .expect("USearchRegistry lock poisoned")
+            .insert(
+                name.to_string(),
+                Arc::new(RegisteredTable {
+                    index,
+                    provider,
+                    key_col: key_col.to_string(),
+                    metric,
+                    schema,
+                    config,
+                }),
+            );
         Ok(())
     }
 
-    pub fn get(&self, name: &str) -> Option<&RegisteredTable> {
-        self.tables.get(name)
+    /// Insert a pre-built [`RegisteredTable`] entry directly.
+    ///
+    /// Used by `VectorIndexManager` to register entries after the
+    /// `SessionContext` is already constructed (on-demand cache path).
+    pub fn insert(&self, name: &str, entry: RegisteredTable) {
+        self.tables
+            .write()
+            .expect("USearchRegistry lock poisoned")
+            .insert(name.to_string(), Arc::new(entry));
+    }
+
+    /// Look up a registered table by its key.
+    ///
+    /// Returns an `Arc` so callers don't hold the lock during query execution.
+    pub fn get(&self, name: &str) -> Option<Arc<RegisteredTable>> {
+        self.tables
+            .read()
+            .expect("USearchRegistry lock poisoned")
+            .get(name)
+            .cloned()
     }
 
     pub fn into_arc(self) -> Arc<Self> {

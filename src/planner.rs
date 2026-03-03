@@ -145,7 +145,7 @@ impl ExtensionPlanner for USearchExecPlanner {
                 .fetch_by_keys(&matches.keys, &registered.key_col, None)
                 .await?;
 
-            let key_col_idx = provider_key_col_idx(registered)?;
+            let key_col_idx = provider_key_col_idx(&registered)?;
             let result_batches =
                 attach_distances(data_batches, key_col_idx, &key_to_dist, &registered.schema)?;
 
@@ -156,7 +156,7 @@ impl ExtensionPlanner for USearchExecPlanner {
             ))))
         } else {
             // ── Adaptive filtered path ────────────────────────────────────────
-            adaptive_filtered_exec(node, registered, session_state, &query).await
+            adaptive_filtered_exec(node, &registered, session_state, &query).await
         }
     }
 }

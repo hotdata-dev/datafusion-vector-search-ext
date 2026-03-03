@@ -63,7 +63,7 @@ async fn make_ctx(metric: MetricKind) -> SessionContext {
     );
 
     let mut reg = USearchRegistry::new();
-    reg.add("items", make_index(metric), provider.clone(), "id", metric)
+    reg.add("items::vector", make_index(metric), provider.clone(), "id", metric)
         .expect("USearchRegistry::add failed");
     let registry = reg.into_arc();
 

@@ -67,7 +67,7 @@ pub mod udtf;
 pub use lookup::{HashKeyProvider, PointLookupProvider};
 pub use node::{DistanceType, USearchNode};
 pub use planner::{USearchExec, USearchExecPlanner, USearchQueryPlanner};
-pub use registry::{USearchIndexConfig, USearchRegistry, USearchTableConfig};
+pub use registry::{RegisteredTable, USearchIndexConfig, USearchRegistry, USearchTableConfig};
 pub use rule::USearchRule;
 pub use udf::{cosine_distance_udf, l2_distance_udf, negative_dot_product_udf};
 pub use udtf::USearchUDTF;

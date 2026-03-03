@@ -65,42 +65,44 @@ impl USearchRule {
         // Accept TableScan directly, or Filter(TableScan) for WHERE clauses.
         // Deeper nesting (Filter→Filter→…) is not absorbed — the rule does
         // not fire and DataFusion falls back to exact execution.
-        let (table_name, filters) = match after_proj {
+        let (table_ref_full, table_name_bare, filters) = match after_proj {
             LogicalPlan::TableScan(TableScan { table_name, .. }) => {
-                (table_name.table().to_string(), vec![])
+                (table_ref_to_str(table_name), table_name.table().to_string(), vec![])
             }
             LogicalPlan::Filter(f) => match f.input.as_ref() {
-                LogicalPlan::TableScan(TableScan { table_name, .. }) => {
-                    (table_name.table().to_string(), vec![f.predicate.clone()])
-                }
+                LogicalPlan::TableScan(TableScan { table_name, .. }) => (
+                    table_ref_to_str(table_name),
+                    table_name.table().to_string(),
+                    vec![f.predicate.clone()],
+                ),
                 _ => return None,
             },
             _ => return None,
         };
 
-        // Table must be registered for vector search.
-        let registered = self.registry.get(&table_name)?;
-
-        // Find the distance UDF in the sort expressions.
-        // Require ASC ordering — all three distance UDFs (l2_distance,
-        // cosine_distance, negative_dot_product) return lower-is-closer values.
-        let mut match_result: Option<(String, String, Vec<f32>, Option<String>)> = None;
+        // Find the distance UDF in the sort expressions first so we know the
+        // vector column name before looking up the registry key.
+        let mut pre_match: Option<(String, String, Vec<f32>, Option<String>)> = None;
         for sort_expr in &sort.expr {
             if let Some((udf_name, vec_col, query_vec)) =
                 find_distance_info(&sort_expr.expr, Some(proj_exprs))
             {
-                // Reject DESC sorts — e.g. ORDER BY negative_dot_product DESC is
-                // asking for the *least* similar vectors; do not rewrite.
                 if !sort_expr.asc {
                     return None;
                 }
                 let alias = extract_alias_name(&sort_expr.expr, proj_exprs);
-                match_result = Some((udf_name, vec_col, query_vec, alias));
+                pre_match = Some((udf_name, vec_col, query_vec, alias));
                 break;
             }
         }
+        let (udf_name, vec_col, query_vec, dist_alias) = pre_match?;
 
-        let (udf_name, vec_col, query_vec, dist_alias) = match_result?;
+        // Registry key: "catalog::schema::table::col" (or fewer parts for bare refs).
+        let reg_key = format!("{}::{}", table_ref_full, vec_col);
+
+        // Table must be registered for vector search.
+        let registered = self.registry.get(&reg_key)?;
+
         let dist_type = match udf_name.as_str() {
             "l2_distance" => DistanceType::L2,
             "cosine_distance" => DistanceType::Cosine,
@@ -114,9 +116,9 @@ impl USearchRule {
             return None;
         }
 
-        // Build USearchNode schema: base fields qualified with the table name +
+        // Build USearchNode schema: base fields qualified with the bare table name +
         // unqualified _distance. Qualifiers must match the original plan's schema.
-        let table_ref = TableReference::bare(table_name.clone());
+        let table_ref = TableReference::bare(table_name_bare.clone());
         let qualified_fields: Vec<(Option<TableReference>, Arc<arrow_schema::Field>)> =
             registered.schema.fields().iter().map(|f| {
                 if f.name() == "_distance" {
@@ -128,7 +130,7 @@ impl USearchRule {
         let vsn_df_schema = DFSchema::new_with_metadata(qualified_fields, HashMap::new()).ok()?;
 
         let node = USearchNode::new(
-            table_name.clone(),
+            reg_key.clone(),
             vec_col,
             query_vec,
             k,
@@ -143,7 +145,7 @@ impl USearchRule {
 
         // Build Projection over USearchNode matching the original output schema.
         let dist_alias_str = dist_alias.as_deref().unwrap_or("_distance");
-        let new_proj_exprs = remap_projections(proj_exprs, dist_alias_str, &table_name);
+        let new_proj_exprs = remap_projections(proj_exprs, dist_alias_str, &table_name_bare);
         let new_proj = Projection::try_new(new_proj_exprs, node_plan).ok()?;
 
         // Keep the Sort node so DataFusion handles ordering by _distance / dist.
@@ -181,6 +183,21 @@ impl datafusion::optimizer::OptimizerRule for USearchRule {
             return Ok(Transformed::yes(new_plan));
         }
         Ok(Transformed::no(plan))
+    }
+}
+
+// ── Table reference helpers ───────────────────────────────────────────────────
+
+/// Convert a [`TableReference`] to a `"::"` separated string.
+///
+/// Used as the prefix for registry keys: `"catalog::schema::table::col"`.
+fn table_ref_to_str(r: &TableReference) -> String {
+    match r {
+        TableReference::Full { catalog, schema, table } => {
+            format!("{}::{}::{}", catalog, schema, table)
+        }
+        TableReference::Partial { schema, table } => format!("{}::{}", schema, table),
+        TableReference::Bare { table } => table.to_string(),
     }
 }
 
