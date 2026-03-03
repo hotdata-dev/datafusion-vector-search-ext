@@ -1,0 +1,17 @@
+[package]
+name = "datafusion-vector-search-ext"
+version = "0.1.0"
+edition = "2024"
+description = "DataFusion extension for USearch HNSW vector similarity search with adaptive WHERE clause filtering"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+datafusion  = "51.0.0"
+usearch     = "2.24.0"
+arrow-array = "57.2.0"
+arrow-schema = "57.2.0"
+async-trait = "0.1"
+tokio       = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
