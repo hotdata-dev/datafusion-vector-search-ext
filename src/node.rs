@@ -30,8 +30,9 @@ pub enum DistanceType {
 pub struct USearchNode {
     pub table_name: String,
     pub vector_col: String,
-    /// Query vector stored as bit-cast u32 to enable Hash/Eq/PartialOrd.
-    query_vec_bits: Vec<u32>,
+    /// Query vector stored as bit-cast u64 (f64 bits) to preserve SQL literal
+    /// precision and enable Hash/Eq/PartialOrd without floating-point equality.
+    query_vec_bits: Vec<u64>,
     pub k: usize,
     /// Distance metric matched from the SQL UDF. Validated against the index
     /// MetricKind before the optimizer rule fires.
@@ -48,7 +49,7 @@ impl USearchNode {
     pub fn new(
         table_name: String,
         vector_col: String,
-        query_vec: Vec<f32>,
+        query_vec: Vec<f64>,
         k: usize,
         distance_type: DistanceType,
         schema: DFSchemaRef,
@@ -58,8 +59,15 @@ impl USearchNode {
         Self { table_name, vector_col, query_vec_bits, k, distance_type, schema, filters }
     }
 
+    /// Returns the query vector as `f64`, preserving SQL literal precision.
+    pub fn query_vec_f64(&self) -> Vec<f64> {
+        self.query_vec_bits.iter().map(|b| f64::from_bits(*b)).collect()
+    }
+
+    /// Returns the query vector as `f32` (cast from f64).
+    /// Use for F32-indexed tables or when f32 precision is sufficient.
     pub fn query_vec(&self) -> Vec<f32> {
-        self.query_vec_bits.iter().map(|b| f32::from_bits(*b)).collect()
+        self.query_vec_bits.iter().map(|b| f64::from_bits(*b) as f32).collect()
     }
 }
 

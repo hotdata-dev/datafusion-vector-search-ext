@@ -175,6 +175,9 @@ pub struct RegisteredTable {
     pub provider: Arc<dyn PointLookupProvider>,
     pub key_col: String,
     pub metric: MetricKind,
+    /// Native scalar type of the vector column.  Determines which typed search
+    /// method (`search::<f32>` vs `search::<f64>`) the planner dispatches to.
+    pub scalar_kind: ScalarKind,
     pub schema: SchemaRef,
     pub config: USearchTableConfig,
 }
@@ -203,6 +206,8 @@ impl USearchRegistry {
     ///   (`u64`).  Supported Arrow types: `UInt64`, `Int64`, `UInt32`, `Int32`.
     /// - `metric` — must match how the index was built.  The optimizer rule
     ///   validates this and refuses to rewrite on mismatch.
+    /// - `scalar_kind` — native element type of the vector column (`F32` or
+    ///   `F64`).  Controls which typed search method the planner dispatches to.
     ///
     /// [`add_with_config`]: USearchRegistry::add_with_config
     /// [`HashKeyProvider`]: crate::lookup::HashKeyProvider
@@ -213,8 +218,9 @@ impl USearchRegistry {
         provider: Arc<dyn PointLookupProvider>,
         key_col: &str,
         metric: MetricKind,
+        scalar_kind: ScalarKind,
     ) -> Result<()> {
-        self.add_with_config(name, index, provider, key_col, metric, USearchTableConfig::default())
+        self.add_with_config(name, index, provider, key_col, metric, scalar_kind, USearchTableConfig::default())
     }
 
     /// Register a USearch index with explicit query configuration.
@@ -228,6 +234,7 @@ impl USearchRegistry {
         provider: Arc<dyn PointLookupProvider>,
         key_col: &str,
         metric: MetricKind,
+        scalar_kind: ScalarKind,
         config: USearchTableConfig,
     ) -> Result<()> {
         // Set ef_search once, here, before any query touches the index.
@@ -256,6 +263,7 @@ impl USearchRegistry {
                     provider,
                     key_col: key_col.to_string(),
                     metric,
+                    scalar_kind,
                     schema,
                     config,
                 }),

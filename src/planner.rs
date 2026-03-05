@@ -28,7 +28,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_array::{Array, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch};
+use arrow_array::{Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, ListArray, LargeListArray, RecordBatch};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::{DFSchema, Result};
@@ -44,6 +44,8 @@ use datafusion::physical_plan::{
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::execution::context::QueryPlanner;
+
+use usearch::ScalarKind;
 
 use crate::lookup::extract_keys_as_u64;
 use crate::node::{DistanceType, USearchNode};
@@ -118,14 +120,11 @@ impl ExtensionPlanner for USearchExecPlanner {
             }
         };
 
-        let query = node.query_vec();
+        let query_f64 = node.query_vec_f64();
 
         if node.filters.is_empty() {
             // ── Unfiltered path (original behaviour) ─────────────────────────
-            let matches = registered
-                .index
-                .search(&query, node.k)
-                .map_err(|e| DataFusionError::Execution(format!("USearch search error: {e}")))?;
+            let matches = usearch_search(&registered.index, &query_f64, node.k, registered.scalar_kind)?;
 
             if matches.keys.is_empty() {
                 return Ok(Some(Arc::new(USearchExec::new(
@@ -156,7 +155,7 @@ impl ExtensionPlanner for USearchExecPlanner {
             ))))
         } else {
             // ── Adaptive filtered path ────────────────────────────────────────
-            adaptive_filtered_exec(node, &registered, session_state, &query).await
+            adaptive_filtered_exec(node, &registered, session_state, &query_f64).await
         }
     }
 }
@@ -167,7 +166,7 @@ async fn adaptive_filtered_exec(
     node: &USearchNode,
     registered: &crate::registry::RegisteredTable,
     session_state: &SessionState,
-    query: &[f32],
+    query: &[f64],
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let provider_schema = registered.provider.schema();
 
@@ -213,7 +212,7 @@ async fn adaptive_filtered_exec(
 
                     if let Some(vi) = vec_col_idx {
                         if let Ok(dist) = compute_distance_for_row(
-                            batch, vi, row_idx, query, &node.distance_type,
+                            batch, vi, row_idx, query, registered.scalar_kind, &node.distance_type,
                         ) {
                             key_distances.push((key, dist));
                         }
@@ -265,10 +264,10 @@ async fn adaptive_filtered_exec(
         // don't satisfy the WHERE clause.  The graph keeps exploring until k
         // passing candidates are found — always returning exactly k results
         // (or fewer if the valid set has < k members).
-        let matches = registered
-            .index
-            .filtered_search(query, node.k, |key| valid_keys.contains(&key))
-            .map_err(|e| DataFusionError::Execution(format!("USearch filtered_search: {e}")))?;
+        let matches = usearch_filtered_search(
+            &registered.index, query, node.k, registered.scalar_kind,
+            |key| valid_keys.contains(&key),
+        )?;
 
         if matches.keys.is_empty() {
             return Ok(Some(Arc::new(USearchExec::new(
@@ -296,6 +295,50 @@ async fn adaptive_filtered_exec(
             registered.schema.clone(),
             result_batches,
         ))))
+    }
+}
+
+// ── USearch dispatch helpers ──────────────────────────────────────────────────
+
+/// Call `index.search` with the native scalar type appropriate for the column.
+/// Converts the usearch error into a `DataFusionError::Execution`.
+fn usearch_search(
+    index: &usearch::Index,
+    query_f64: &[f64],
+    k: usize,
+    scalar_kind: ScalarKind,
+) -> Result<usearch::ffi::Matches> {
+    match scalar_kind {
+        ScalarKind::F64 => index.search(query_f64, k)
+            .map_err(|e| DataFusionError::Execution(format!("USearch search error: {e}"))),
+        _ => {
+            let q: Vec<f32> = query_f64.iter().map(|&v| v as f32).collect();
+            index.search(&q, k)
+                .map_err(|e| DataFusionError::Execution(format!("USearch search error: {e}")))
+        }
+    }
+}
+
+/// Call `index.filtered_search` with the native scalar type appropriate for the column.
+/// Converts the usearch error into a `DataFusionError::Execution`.
+fn usearch_filtered_search<F>(
+    index: &usearch::Index,
+    query_f64: &[f64],
+    k: usize,
+    scalar_kind: ScalarKind,
+    predicate: F,
+) -> Result<usearch::ffi::Matches>
+where
+    F: Fn(u64) -> bool,
+{
+    match scalar_kind {
+        ScalarKind::F64 => index.filtered_search(query_f64, k, predicate)
+            .map_err(|e| DataFusionError::Execution(format!("USearch filtered_search: {e}"))),
+        _ => {
+            let q: Vec<f32> = query_f64.iter().map(|&v| v as f32).collect();
+            index.filtered_search(&q, k, predicate)
+                .map_err(|e| DataFusionError::Execution(format!("USearch filtered_search: {e}")))
+        }
     }
 }
 
@@ -334,51 +377,90 @@ fn evaluate_filters(
     Ok(combined.unwrap())
 }
 
-/// Extract the distance from a single row of a FixedSizeList<Float32> vector column.
-/// Uses USearch-equivalent distance kernels (L2sq without sqrt, cosine, negative dot).
+/// Extract the distance from a single row of a vector column.
+///
+/// Handles all combinations of outer array type (FixedSizeList / List / LargeList)
+/// and inner element type (Float32 / Float64).  The distance is always returned as
+/// `f32` — matching the `_distance` column type — regardless of the column's native
+/// precision.  Query is accepted as `f64` and cast to the column's native type.
 fn compute_distance_for_row(
     batch: &RecordBatch,
     vec_col_idx: usize,
     row_idx: usize,
-    query: &[f32],
+    query_f64: &[f64],
+    scalar_kind: ScalarKind,
     dist_type: &DistanceType,
 ) -> Result<f32> {
     let col = batch.column(vec_col_idx);
-    let fsl = col.as_any().downcast_ref::<FixedSizeListArray>().ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "vector column is not FixedSizeListArray (got {:?})",
-            col.data_type()
-        ))
-    })?;
 
-    if fsl.is_null(row_idx) {
+    if col.is_null(row_idx) {
         return Err(DataFusionError::Execution(
             "null vector in brute-force distance computation".into(),
         ));
     }
 
-    let row_arr = fsl.value(row_idx);
-    let f32_arr = row_arr.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
-        DataFusionError::Execution("vector inner array is not Float32Array".into())
-    })?;
-    let v = f32_arr.values();
-
-    let dist = match dist_type {
-        // L2sq — matches USearch MetricKind::L2sq (no sqrt).
-        DistanceType::L2 => v.iter().zip(query).map(|(a, b)| (a - b) * (a - b)).sum::<f32>(),
-        // Cosine distance = 1 - cosine_similarity.
-        DistanceType::Cosine => {
-            let dot: f32 = v.iter().zip(query).map(|(a, b)| a * b).sum();
-            let norm_v: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let norm_q: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let denom = norm_v * norm_q;
-            if denom == 0.0 { 1.0 } else { 1.0 - dot / denom }
-        }
-        // Negative inner product — matches USearch MetricKind::IP.
-        DistanceType::NegativeDot => -v.iter().zip(query).map(|(a, b)| a * b).sum::<f32>(),
+    // Extract the row's inner array, regardless of outer type.
+    let row_arr: Arc<dyn Array> = if let Some(fsl) = col.as_any().downcast_ref::<FixedSizeListArray>() {
+        fsl.value(row_idx)
+    } else if let Some(la) = col.as_any().downcast_ref::<ListArray>() {
+        la.value(row_idx)
+    } else if let Some(la) = col.as_any().downcast_ref::<LargeListArray>() {
+        la.value(row_idx)
+    } else {
+        return Err(DataFusionError::Execution(format!(
+            "vector column type not supported in brute-force path (got {:?})",
+            col.data_type()
+        )));
     };
 
-    Ok(dist)
+    // Dispatch distance computation by the column's native element type.
+    match scalar_kind {
+        ScalarKind::F64 => {
+            let f64_arr = row_arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                DataFusionError::Execution("F64 column: inner array is not Float64Array".into())
+            })?;
+            let v = f64_arr.values();
+            let query = query_f64;
+            let dist = match dist_type {
+                DistanceType::L2 => v.iter().zip(query).map(|(a, b)| (a - b) * (a - b)).sum::<f64>(),
+                DistanceType::Cosine => {
+                    let dot: f64 = v.iter().zip(query).map(|(a, b)| a * b).sum();
+                    let norm_v: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    let norm_q: f64 = query.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    let denom = norm_v * norm_q;
+                    if denom == 0.0 { 1.0 } else { 1.0 - dot / denom }
+                }
+                DistanceType::NegativeDot => -v.iter().zip(query).map(|(a, b)| a * b).sum::<f64>(),
+            };
+            Ok(dist as f32)
+        }
+        _ => {
+            // F32 (and any other kind): extract as f32, cast query to f32.
+            let f32_arr = row_arr.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "F32 column: inner array is not Float32Array (got {:?})",
+                    row_arr.data_type()
+                ))
+            })?;
+            let v = f32_arr.values();
+            let query: Vec<f32> = query_f64.iter().map(|&x| x as f32).collect();
+            let dist = match dist_type {
+                // L2sq — matches USearch MetricKind::L2sq (no sqrt).
+                DistanceType::L2 => v.iter().zip(&query).map(|(a, b)| (a - b) * (a - b)).sum::<f32>(),
+                // Cosine distance = 1 - cosine_similarity.
+                DistanceType::Cosine => {
+                    let dot: f32 = v.iter().zip(&query).map(|(a, b)| a * b).sum();
+                    let norm_v: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let norm_q: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let denom = norm_v * norm_q;
+                    if denom == 0.0 { 1.0 } else { 1.0 - dot / denom }
+                }
+                // Negative inner product — matches USearch MetricKind::IP.
+                DistanceType::NegativeDot => -v.iter().zip(&query).map(|(a, b)| a * b).sum::<f32>(),
+            };
+            Ok(dist)
+        }
+    }
 }
 
 /// Select the k smallest-distance (key, dist) pairs from `pairs` using a

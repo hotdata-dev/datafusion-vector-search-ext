@@ -18,6 +18,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
+
 use datafusion_vector_search_ext::{
     HashKeyProvider, USearchNode, USearchRegistry, register_all,
 };
@@ -62,8 +63,8 @@ async fn make_ctx(metric: MetricKind) -> SessionContext {
             .expect("HashKeyProvider::try_new failed"),
     );
 
-    let mut reg = USearchRegistry::new();
-    reg.add("items::vector", make_index(metric), provider.clone(), "id", metric)
+    let reg = USearchRegistry::new();
+    reg.add("items::vector", make_index(metric), provider.clone(), "id", metric, ScalarKind::F32)
         .expect("USearchRegistry::add failed");
     let registry = reg.into_arc();
 

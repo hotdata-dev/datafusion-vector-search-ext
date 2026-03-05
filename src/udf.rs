@@ -10,7 +10,7 @@ use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array, ListArray};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray};
 use arrow_schema::DataType;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
@@ -98,7 +98,24 @@ impl ScalarUDFImpl for DistanceUDF {
     }
 }
 
-/// Compute per-row distances from a vector column (FixedSizeList or List) and a query slice.
+/// Extract f32 values from a row's inner array, casting Float64 → f32 if needed.
+fn inner_to_f32(inner: &dyn Array, udf_name: &str) -> Result<Vec<f32>> {
+    if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
+        return Ok(f32a.values().to_vec());
+    }
+    if let Some(f64a) = inner.as_any().downcast_ref::<Float64Array>() {
+        return Ok(f64a.values().iter().map(|&v| v as f32).collect());
+    }
+    Err(DataFusionError::Execution(format!(
+        "{udf_name}: inner element type must be Float32 or Float64, got {:?}",
+        inner.data_type()
+    )))
+}
+
+/// Compute per-row distances from a vector column and a query slice.
+///
+/// Supports all outer array types (FixedSizeList, List, LargeList) and
+/// inner element types (Float32, Float64 — Float64 is cast to f32 for the kernel).
 fn compute_distances(
     vec_col: &dyn Array,
     query_vec: &[f32],
@@ -113,11 +130,8 @@ fn compute_distances(
                 out.push(None);
                 continue;
             }
-            let row = fsl.value(i);
-            let f32s = row.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
-                DataFusionError::Execution(format!("{udf_name}: inner array must be Float32Array"))
-            })?;
-            out.push(Some(kernel(f32s.values(), query_vec)));
+            let f32s = inner_to_f32(&*fsl.value(i), udf_name)?;
+            out.push(Some(kernel(&f32s, query_vec)));
         }
         return Ok(out);
     }
@@ -130,17 +144,28 @@ fn compute_distances(
                 out.push(None);
                 continue;
             }
-            let row = lst.value(i);
-            let f32s = row.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
-                DataFusionError::Execution(format!("{udf_name}: inner array must be Float32Array"))
-            })?;
-            out.push(Some(kernel(f32s.values(), query_vec)));
+            let f32s = inner_to_f32(&*lst.value(i), udf_name)?;
+            out.push(Some(kernel(&f32s, query_vec)));
+        }
+        return Ok(out);
+    }
+
+    // LargeListArray — large-offset variant, e.g. some Postgres/Parquet encodings
+    if let Some(lst) = vec_col.as_any().downcast_ref::<LargeListArray>() {
+        let mut out = Vec::with_capacity(lst.len());
+        for i in 0..lst.len() {
+            if lst.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let f32s = inner_to_f32(&*lst.value(i), udf_name)?;
+            out.push(Some(kernel(&f32s, query_vec)));
         }
         return Ok(out);
     }
 
     Err(DataFusionError::Execution(format!(
-        "{udf_name}: arg0 must be FixedSizeList or List(Float32), got {:?}",
+        "{udf_name}: arg0 must be FixedSizeList, List, or LargeList(Float32/Float64), got {:?}",
         vec_col.data_type()
     )))
 }
@@ -149,50 +174,46 @@ fn extract_query_vec(val: &ColumnarValue) -> Result<Vec<f32>> {
     match val {
         ColumnarValue::Scalar(sv) => scalar_to_f32_vec(sv),
         ColumnarValue::Array(arr) => {
+            // FixedSizeList — DuckDB FLOAT[N] columns
             if let Some(fsl) = arr.as_any().downcast_ref::<FixedSizeListArray>() {
                 if fsl.is_empty() {
                     return Err(DataFusionError::Execution("query vec is empty".into()));
                 }
-                let inner = fsl.value(0);
-                let f32arr = inner.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
-                    DataFusionError::Execution("query vec inner must be Float32Array".into())
-                })?;
+                return inner_to_f32(&*fsl.value(0), "query_vec");
+            }
+            // List / LargeList — Postgres real[] or float8[]
+            if let Some(la) = arr.as_any().downcast_ref::<ListArray>() {
+                if la.is_empty() {
+                    return Err(DataFusionError::Execution("query vec is empty".into()));
+                }
+                return inner_to_f32(&*la.value(0), "query_vec");
+            }
+            if let Some(la) = arr.as_any().downcast_ref::<LargeListArray>() {
+                if la.is_empty() {
+                    return Err(DataFusionError::Execution("query vec is empty".into()));
+                }
+                return inner_to_f32(&*la.value(0), "query_vec");
+            }
+            // Flat Float32Array or Float64Array (uncommon but valid)
+            if let Some(f32arr) = arr.as_any().downcast_ref::<Float32Array>() {
                 return Ok(f32arr.values().to_vec());
             }
-            let f32arr = arr.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "Cannot interpret query arg as f32 vec: {:?}",
-                    arr.data_type()
-                ))
-            })?;
-            Ok(f32arr.values().to_vec())
+            if let Some(f64arr) = arr.as_any().downcast_ref::<Float64Array>() {
+                return Ok(f64arr.values().iter().map(|&v| v as f32).collect());
+            }
+            Err(DataFusionError::Execution(format!(
+                "Cannot interpret query arg as f32 vec: {:?}",
+                arr.data_type()
+            )))
         }
     }
 }
 
 fn scalar_to_f32_vec(sv: &ScalarValue) -> Result<Vec<f32>> {
-    use arrow_array::{Float32Array, Float64Array};
     match sv {
-        ScalarValue::FixedSizeList(arr) => {
-            let inner = arr.value(0);
-            if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
-                return Ok(f32a.values().to_vec());
-            }
-            if let Some(f64a) = inner.as_any().downcast_ref::<Float64Array>() {
-                return Ok(f64a.values().iter().map(|&v| v as f32).collect());
-            }
-            Err(DataFusionError::Execution("FixedSizeList inner is not Float32/Float64".into()))
-        }
-        ScalarValue::List(arr) => {
-            let inner = arr.value(0);
-            if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
-                return Ok(f32a.values().to_vec());
-            }
-            if let Some(f64a) = inner.as_any().downcast_ref::<Float64Array>() {
-                return Ok(f64a.values().iter().map(|&v| v as f32).collect());
-            }
-            Err(DataFusionError::Execution("List scalar inner is not Float32/Float64".into()))
-        }
+        ScalarValue::FixedSizeList(arr) => inner_to_f32(&*arr.value(0), "scalar_query_vec"),
+        ScalarValue::List(arr) => inner_to_f32(&*arr.value(0), "scalar_query_vec"),
+        ScalarValue::LargeList(arr) => inner_to_f32(&*arr.value(0), "scalar_query_vec"),
         other => Err(DataFusionError::Execution(format!(
             "Unsupported scalar type for query vec: {:?}",
             other

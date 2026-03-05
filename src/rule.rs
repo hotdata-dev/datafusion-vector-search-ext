@@ -82,7 +82,7 @@ impl USearchRule {
 
         // Find the distance UDF in the sort expressions first so we know the
         // vector column name before looking up the registry key.
-        let mut pre_match: Option<(String, String, Vec<f32>, Option<String>)> = None;
+        let mut pre_match: Option<(String, String, Vec<f64>, Option<String>)> = None;
         for sort_expr in &sort.expr {
             if let Some((udf_name, vec_col, query_vec)) =
                 find_distance_info(&sort_expr.expr, Some(proj_exprs))
@@ -206,7 +206,7 @@ fn table_ref_to_str(r: &TableReference) -> String {
 fn find_distance_info(
     expr: &Expr,
     proj_exprs: Option<&[Expr]>,
-) -> Option<(String, String, Vec<f32>)> {
+) -> Option<(String, String, Vec<f64>)> {
     if let Some(info) = try_extract_distance(expr) {
         return Some(info);
     }
@@ -261,7 +261,7 @@ fn is_distance_expr(expr: &Expr) -> bool {
     matches!(expr, Expr::ScalarFunction(sf) if is_dist_udf_name(sf.func.name()))
 }
 
-fn try_extract_distance(expr: &Expr) -> Option<(String, String, Vec<f32>)> {
+fn try_extract_distance(expr: &Expr) -> Option<(String, String, Vec<f64>)> {
     let inner = match expr {
         Expr::Alias(a) => a.expr.as_ref(),
         other => other,
@@ -278,7 +278,7 @@ fn try_extract_distance(expr: &Expr) -> Option<(String, String, Vec<f32>)> {
         Expr::Column(c) => c.name.clone(),
         _ => return None,
     };
-    let query_vec = extract_f32_vec_from_expr(&sf.args[1])?;
+    let query_vec = extract_f64_vec_from_expr(&sf.args[1])?;
     Some((udf_name, vec_col, query_vec))
 }
 
@@ -306,7 +306,12 @@ fn remap_one(expr: &Expr, dist_alias_name: &str, table_name: &str) -> Expr {
     }
 }
 
-fn extract_f32_vec_from_expr(expr: &Expr) -> Option<Vec<f32>> {
+/// Extract a query vector as `Vec<f64>` from a SQL literal expression.
+///
+/// Preserves full f64 precision so that SQL literals like `ARRAY[0.123456789012345]`
+/// are not silently rounded to f32 before reaching the index search.  The
+/// planner casts to the index's native scalar kind (f32/f64) at the last moment.
+fn extract_f64_vec_from_expr(expr: &Expr) -> Option<Vec<f64>> {
     use arrow_array::{Float32Array, Float64Array};
     use datafusion::scalar::ScalarValue;
 
@@ -316,22 +321,22 @@ fn extract_f32_vec_from_expr(expr: &Expr) -> Option<Vec<f32>> {
             ScalarValue::FixedSizeList(arr) => {
                 if arr.is_empty() { return None; }
                 let inner = arr.value(0);
-                if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
-                    return Some(f32a.values().to_vec());
-                }
                 if let Some(f64a) = inner.as_any().downcast_ref::<Float64Array>() {
-                    return Some(f64a.values().iter().map(|&v| v as f32).collect());
+                    return Some(f64a.values().to_vec());
+                }
+                if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
+                    return Some(f32a.values().iter().map(|&v| v as f64).collect());
                 }
                 None
             }
             ScalarValue::List(arr) => {
                 if arr.is_empty() { return None; }
                 let inner = arr.value(0);
-                if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
-                    return Some(f32a.values().to_vec());
-                }
                 if let Some(f64a) = inner.as_any().downcast_ref::<Float64Array>() {
-                    return Some(f64a.values().iter().map(|&v| v as f32).collect());
+                    return Some(f64a.values().to_vec());
+                }
+                if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
+                    return Some(f32a.values().iter().map(|&v| v as f64).collect());
                 }
                 None
             }
@@ -343,10 +348,10 @@ fn extract_f32_vec_from_expr(expr: &Expr) -> Option<Vec<f32>> {
             let mut result = Vec::with_capacity(sf.args.len());
             for arg in &sf.args {
                 match arg {
-                    Expr::Literal(ScalarValue::Float64(Some(v)), _) => result.push(*v as f32),
-                    Expr::Literal(ScalarValue::Float32(Some(v)), _) => result.push(*v),
-                    Expr::Literal(ScalarValue::Int64(Some(v)), _) => result.push(*v as f32),
-                    Expr::Literal(ScalarValue::Int32(Some(v)), _) => result.push(*v as f32),
+                    Expr::Literal(ScalarValue::Float64(Some(v)), _) => result.push(*v),
+                    Expr::Literal(ScalarValue::Float32(Some(v)), _) => result.push(*v as f64),
+                    Expr::Literal(ScalarValue::Int64(Some(v)), _) => result.push(*v as f64),
+                    Expr::Literal(ScalarValue::Int32(Some(v)), _) => result.push(*v as f64),
                     _ => return None,
                 }
             }
