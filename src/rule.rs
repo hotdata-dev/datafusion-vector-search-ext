@@ -56,16 +56,16 @@ impl USearchRule {
         };
         let k = sort.fetch?;
 
-        // Require Projection immediately below Sort.
-        let (proj_exprs, after_proj) = match sort.input.as_ref() {
+        // Projection is optional — DataFusion 51 omits it for SELECT * queries.
+        let (proj_exprs_slice, after_sort): (&[Expr], &LogicalPlan) = match sort.input.as_ref() {
             LogicalPlan::Projection(p) => (p.expr.as_slice(), p.input.as_ref()),
-            _ => return None,
+            other => (&[], other),
         };
 
         // Accept TableScan directly, or Filter(TableScan) for WHERE clauses.
         // Deeper nesting (Filter→Filter→…) is not absorbed — the rule does
         // not fire and DataFusion falls back to exact execution.
-        let (table_ref_full, table_name_bare, filters) = match after_proj {
+        let (table_ref_full, table_name_bare, filters) = match after_sort {
             LogicalPlan::TableScan(TableScan { table_name, .. }) => {
                 (table_ref_to_str(table_name), table_name.table().to_string(), vec![])
             }
@@ -85,12 +85,12 @@ impl USearchRule {
         let mut pre_match: Option<(String, String, Vec<f64>, Option<String>)> = None;
         for sort_expr in &sort.expr {
             if let Some((udf_name, vec_col, query_vec)) =
-                find_distance_info(&sort_expr.expr, Some(proj_exprs))
+                find_distance_info(&sort_expr.expr, Some(proj_exprs_slice))
             {
                 if !sort_expr.asc {
                     return None;
                 }
-                let alias = extract_alias_name(&sort_expr.expr, proj_exprs);
+                let alias = extract_alias_name(&sort_expr.expr, proj_exprs_slice);
                 pre_match = Some((udf_name, vec_col, query_vec, alias));
                 break;
             }
@@ -135,7 +135,7 @@ impl USearchRule {
             query_vec,
             k,
             dist_type,
-            Arc::new(vsn_df_schema),
+            Arc::new(vsn_df_schema.clone()),
             filters,
         );
 
@@ -145,7 +145,11 @@ impl USearchRule {
 
         // Build Projection over USearchNode matching the original output schema.
         let dist_alias_str = dist_alias.as_deref().unwrap_or("_distance");
-        let new_proj_exprs = remap_projections(proj_exprs, dist_alias_str, &table_name_bare);
+        let new_proj_exprs = if proj_exprs_slice.is_empty() {
+            passthrough_projection(&vsn_df_schema, &table_name_bare)
+        } else {
+            remap_projections(proj_exprs_slice, dist_alias_str, &table_name_bare)
+        };
         let new_proj = Projection::try_new(new_proj_exprs, node_plan).ok()?;
 
         // Keep the Sort node so DataFusion handles ordering by _distance / dist.
@@ -284,6 +288,17 @@ fn try_extract_distance(expr: &Expr) -> Option<(String, String, Vec<f64>)> {
 
 fn remap_projections(proj_exprs: &[Expr], dist_alias_name: &str, table_name: &str) -> Vec<Expr> {
     proj_exprs.iter().map(|e| remap_one(e, dist_alias_name, table_name)).collect()
+}
+
+/// Build a passthrough Projection for SELECT * queries (no original Projection node).
+/// Projects only the original table columns (not `_distance`) so the output schema
+/// matches the original Sort schema. The Sort re-evaluates the distance UDF expression
+/// on the k result rows returned by USearchExec (O(k × dim), negligible for small k).
+fn passthrough_projection(schema: &DFSchema, table_name: &str) -> Vec<Expr> {
+    schema.inner().fields().iter()
+        .filter(|f| f.name() != "_distance")
+        .map(|f| col(format!("{table_name}.{}", f.name()).as_str()))
+        .collect()
 }
 
 fn remap_one(expr: &Expr, dist_alias_name: &str, table_name: &str) -> Expr {

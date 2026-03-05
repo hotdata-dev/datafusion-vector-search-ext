@@ -223,6 +223,34 @@ async fn test_ip_index_cosine_udf_no_rewrite() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// SELECT * (no Projection node) — rule must fire
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// DataFusion 51 omits the Projection node for SELECT * queries.
+/// The rule must match Sort→TableScan directly (no Projection between them).
+#[tokio::test]
+async fn test_select_star_l2_rewrites() {
+    let ctx = make_ctx(MetricKind::L2sq).await;
+    let sql = format!("SELECT * FROM items ORDER BY l2_distance(vector, {Q}) ASC LIMIT 5");
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        contains_usearch_node(&plan),
+        "SELECT * + l2_distance ASC (no Projection) → rule must fire\nPlan: {plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_select_star_cosine_rewrites() {
+    let ctx = make_ctx(MetricKind::Cos).await;
+    let sql = format!("SELECT * FROM items ORDER BY cosine_distance(vector, {Q}) ASC LIMIT 5");
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        contains_usearch_node(&plan),
+        "SELECT * + cosine_distance ASC (no Projection) → rule must fire\nPlan: {plan:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // DESC SORT — rule must NOT fire even when metric matches
 // ═══════════════════════════════════════════════════════════════════════════════
 
