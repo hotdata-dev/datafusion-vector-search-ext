@@ -268,3 +268,158 @@ async fn test_desc_sort_no_rewrite() {
         "l2_distance DESC (metric matches but wrong direction) → rule must not fire"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORDER BY UDF directly — no distance alias in SELECT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// SELECT projects only non-distance columns; ORDER BY uses the UDF expression
+/// directly. The rule must still match because find_distance_info resolves the
+/// sort expression without requiring it to appear in the projection list.
+#[tokio::test]
+async fn test_order_by_udf_direct_no_dist_in_select_rewrites() {
+    let ctx = make_ctx(MetricKind::L2sq).await;
+    let sql = format!("SELECT id FROM items ORDER BY l2_distance(vector, {Q}) ASC LIMIT 5");
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        contains_usearch_node(&plan),
+        "ORDER BY UDF (dist not projected) → rule must fire\nPlan: {plan:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WHERE clause — filter predicate absorbed into USearchNode
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_where_clause_absorbed_rewrites() {
+    let ctx = make_ctx(MetricKind::L2sq).await;
+    let sql = format!(
+        "SELECT id FROM items WHERE id > 10 ORDER BY l2_distance(vector, {Q}) ASC LIMIT 5"
+    );
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        contains_usearch_node(&plan),
+        "WHERE clause → Filter(TableScan) absorbed into USearchNode, rule must fire\nPlan: {plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_where_clause_with_alias_order_by_rewrites() {
+    let ctx = make_ctx(MetricKind::L2sq).await;
+    let sql = format!(
+        "SELECT id, l2_distance(vector, {Q}) AS dist FROM items WHERE id > 5 ORDER BY dist ASC LIMIT 3"
+    );
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        contains_usearch_node(&plan),
+        "WHERE clause + alias ORDER BY → rule must fire\nPlan: {plan:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// No LIMIT — rule must NOT fire (k is unknown)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_no_limit_no_rewrite() {
+    let ctx = make_ctx(MetricKind::L2sq).await;
+    let sql = format!("SELECT id FROM items ORDER BY l2_distance(vector, {Q}) ASC");
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        !contains_usearch_node(&plan),
+        "no LIMIT → k is unknown, rule must not fire\nPlan: {plan:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fully-qualified table reference (catalog.schema.table)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// When SQL uses `datafusion.public.items`, the TableScan carries a Full
+// TableReference. Before the schema-qualifier fix, USearchNode's DFSchema was
+// always built with a Bare reference, causing a post-optimizer schema mismatch
+// whenever the query projected the alias into the SELECT list.
+
+/// Register index under the fully-qualified key matching `datafusion.public.items`.
+async fn make_ctx_qualified(metric: MetricKind) -> SessionContext {
+    let schema = items_schema();
+    let provider = Arc::new(
+        HashKeyProvider::try_new(schema.clone(), vec![], "id")
+            .expect("HashKeyProvider::try_new failed"),
+    );
+    let reg = USearchRegistry::new();
+    // Key must match table_ref_to_str(Full{catalog,schema,table}) + "::" + col.
+    reg.add(
+        "datafusion::public::items::vector",
+        make_index(metric),
+        provider.clone(),
+        "id",
+        metric,
+        ScalarKind::F32,
+    )
+    .expect("USearchRegistry::add failed");
+    let registry = reg.into_arc();
+
+    let ctx = SessionContext::default();
+    register_all(&ctx, registry).expect("register_all failed");
+    ctx.register_table("items", provider).expect("register_table failed");
+    ctx
+}
+
+/// ORDER BY UDF inline, fully-qualified table — rule must fire.
+#[tokio::test]
+async fn test_qualified_ref_order_by_udf_rewrites() {
+    let ctx = make_ctx_qualified(MetricKind::L2sq).await;
+    let sql = format!(
+        "SELECT id FROM datafusion.public.items ORDER BY l2_distance(vector, {Q}) ASC LIMIT 5"
+    );
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        contains_usearch_node(&plan),
+        "qualified ref + ORDER BY UDF → rule must fire\nPlan: {plan:?}"
+    );
+}
+
+/// ORDER BY alias, fully-qualified table — previously crashed with schema
+/// qualifier mismatch. This is the regression test for that bug.
+#[tokio::test]
+async fn test_qualified_ref_order_by_alias_rewrites() {
+    let ctx = make_ctx_qualified(MetricKind::L2sq).await;
+    let sql = format!(
+        "SELECT id, l2_distance(vector, {Q}) AS dist FROM datafusion.public.items ORDER BY dist ASC LIMIT 5"
+    );
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        contains_usearch_node(&plan),
+        "qualified ref + ORDER BY alias → schema qualifier must be preserved, rule must fire\nPlan: {plan:?}"
+    );
+}
+
+/// SELECT * with fully-qualified table — rule must fire.
+#[tokio::test]
+async fn test_qualified_ref_select_star_rewrites() {
+    let ctx = make_ctx_qualified(MetricKind::L2sq).await;
+    let sql = format!(
+        "SELECT * FROM datafusion.public.items ORDER BY l2_distance(vector, {Q}) ASC LIMIT 5"
+    );
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        contains_usearch_node(&plan),
+        "qualified ref + SELECT * → rule must fire\nPlan: {plan:?}"
+    );
+}
+
+/// WHERE clause with fully-qualified table — filter absorbed, rule must fire.
+#[tokio::test]
+async fn test_qualified_ref_where_clause_rewrites() {
+    let ctx = make_ctx_qualified(MetricKind::L2sq).await;
+    let sql = format!(
+        "SELECT id FROM datafusion.public.items WHERE id > 0 ORDER BY l2_distance(vector, {Q}) ASC LIMIT 5"
+    );
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        contains_usearch_node(&plan),
+        "qualified ref + WHERE → filter absorbed, rule must fire\nPlan: {plan:?}"
+    );
+}
