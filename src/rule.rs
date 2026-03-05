@@ -65,14 +65,15 @@ impl USearchRule {
         // Accept TableScan directly, or Filter(TableScan) for WHERE clauses.
         // Deeper nesting (Filter→Filter→…) is not absorbed — the rule does
         // not fire and DataFusion falls back to exact execution.
-        let (table_ref_full, table_name_bare, filters) = match after_sort {
+        let (table_ref_full, _table_name_bare, scan_table_ref, filters) = match after_sort {
             LogicalPlan::TableScan(TableScan { table_name, .. }) => {
-                (table_ref_to_str(table_name), table_name.table().to_string(), vec![])
+                (table_ref_to_str(table_name), table_name.table().to_string(), table_name.clone(), vec![])
             }
             LogicalPlan::Filter(f) => match f.input.as_ref() {
                 LogicalPlan::TableScan(TableScan { table_name, .. }) => (
                     table_ref_to_str(table_name),
                     table_name.table().to_string(),
+                    table_name.clone(),
                     vec![f.predicate.clone()],
                 ),
                 _ => return None,
@@ -116,9 +117,9 @@ impl USearchRule {
             return None;
         }
 
-        // Build USearchNode schema: base fields qualified with the bare table name +
-        // unqualified _distance. Qualifiers must match the original plan's schema.
-        let table_ref = TableReference::bare(table_name_bare.clone());
+        // Build USearchNode schema: base fields qualified with the original table
+        // reference (Full/Partial/Bare) so qualifiers match the original plan's schema.
+        let table_ref = scan_table_ref.clone();
         let qualified_fields: Vec<(Option<TableReference>, Arc<arrow_schema::Field>)> =
             registered.schema.fields().iter().map(|f| {
                 if f.name() == "_distance" {
@@ -146,9 +147,9 @@ impl USearchRule {
         // Build Projection over USearchNode matching the original output schema.
         let dist_alias_str = dist_alias.as_deref().unwrap_or("_distance");
         let new_proj_exprs = if proj_exprs_slice.is_empty() {
-            passthrough_projection(&vsn_df_schema, &table_name_bare)
+            passthrough_projection(&vsn_df_schema, &table_ref)
         } else {
-            remap_projections(proj_exprs_slice, dist_alias_str, &table_name_bare)
+            remap_projections(proj_exprs_slice, dist_alias_str, &table_ref)
         };
         let new_proj = Projection::try_new(new_proj_exprs, node_plan).ok()?;
 
@@ -286,22 +287,24 @@ fn try_extract_distance(expr: &Expr) -> Option<(String, String, Vec<f64>)> {
     Some((udf_name, vec_col, query_vec))
 }
 
-fn remap_projections(proj_exprs: &[Expr], dist_alias_name: &str, table_name: &str) -> Vec<Expr> {
-    proj_exprs.iter().map(|e| remap_one(e, dist_alias_name, table_name)).collect()
+fn remap_projections(proj_exprs: &[Expr], dist_alias_name: &str, table_ref: &TableReference) -> Vec<Expr> {
+    proj_exprs.iter().map(|e| remap_one(e, dist_alias_name, table_ref)).collect()
 }
 
 /// Build a passthrough Projection for SELECT * queries (no original Projection node).
 /// Projects only the original table columns (not `_distance`) so the output schema
 /// matches the original Sort schema. The Sort re-evaluates the distance UDF expression
 /// on the k result rows returned by USearchExec (O(k × dim), negligible for small k).
-fn passthrough_projection(schema: &DFSchema, table_name: &str) -> Vec<Expr> {
+fn passthrough_projection(schema: &DFSchema, table_ref: &TableReference) -> Vec<Expr> {
     schema.inner().fields().iter()
         .filter(|f| f.name() != "_distance")
-        .map(|f| col(format!("{table_name}.{}", f.name()).as_str()))
+        .map(|f| Expr::Column(datafusion::common::Column::new(
+            Some(table_ref.clone()), f.name().as_str()
+        )))
         .collect()
 }
 
-fn remap_one(expr: &Expr, dist_alias_name: &str, table_name: &str) -> Expr {
+fn remap_one(expr: &Expr, dist_alias_name: &str, table_ref: &TableReference) -> Expr {
     match expr {
         Expr::Alias(a) if a.name == dist_alias_name && is_distance_expr(&a.expr) => {
             col("_distance").alias(a.name.as_str())
@@ -311,11 +314,15 @@ fn remap_one(expr: &Expr, dist_alias_name: &str, table_name: &str) -> Expr {
         }
         Expr::Alias(a) => match a.expr.as_ref() {
             Expr::Column(c) => {
-                col(format!("{table_name}.{}", c.name).as_str()).alias(a.name.as_str())
+                Expr::Column(datafusion::common::Column::new(
+                    Some(table_ref.clone()), c.name.as_str()
+                )).alias(a.name.as_str())
             }
             _ => col(a.name.as_str()),
         },
-        Expr::Column(c) => col(format!("{table_name}.{}", c.name).as_str()),
+        Expr::Column(c) => Expr::Column(datafusion::common::Column::new(
+            Some(table_ref.clone()), c.name.as_str()
+        )),
         Expr::ScalarFunction(sf) if is_dist_udf_name(sf.func.name()) => col("_distance"),
         other => other.clone(),
     }
