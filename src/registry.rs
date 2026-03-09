@@ -312,6 +312,17 @@ impl USearchRegistry {
             .cloned()
     }
 
+    /// Remove all registry entries whose name starts with `prefix`.
+    ///
+    /// Use `"conn::schema::table::"` to evict all columns for one table,
+    /// or `"conn::"` to evict all tables for a connection.
+    pub fn remove_by_prefix(&self, prefix: &str) {
+        self.tables
+            .write()
+            .expect("USearchRegistry lock poisoned")
+            .retain(|k, _| !k.starts_with(prefix));
+    }
+
     pub fn into_arc(self) -> Arc<Self> {
         Arc::new(self)
     }
