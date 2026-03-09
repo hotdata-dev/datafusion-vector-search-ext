@@ -18,10 +18,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
-
-use datafusion_vector_search_ext::{
-    HashKeyProvider, USearchNode, USearchRegistry, register_all,
-};
+use datafusion_vector_search_ext::{HashKeyProvider, USearchNode, USearchRegistry, register_all};
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 
@@ -30,10 +27,7 @@ fn items_schema() -> Arc<Schema> {
         Field::new("id", DataType::UInt64, false),
         Field::new(
             "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                4,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
             false,
         ),
     ]))
@@ -64,8 +58,15 @@ async fn make_ctx(metric: MetricKind) -> SessionContext {
     );
 
     let reg = USearchRegistry::new();
-    reg.add("items::vector", make_index(metric), provider.clone(), "id", metric, ScalarKind::F32)
-        .expect("USearchRegistry::add failed");
+    reg.add(
+        "items::vector",
+        make_index(metric),
+        provider.clone(),
+        "id",
+        metric,
+        ScalarKind::F32,
+    )
+    .expect("USearchRegistry::add failed");
     let registry = reg.into_arc();
 
     let ctx = SessionContext::default();
@@ -73,7 +74,8 @@ async fn make_ctx(metric: MetricKind) -> SessionContext {
 
     // HashKeyProvider also implements TableProvider, so register it directly
     // for SQL column-name resolution — no separate MemTable needed.
-    ctx.register_table("items", provider).expect("register_table failed");
+    ctx.register_table("items", provider)
+        .expect("register_table failed");
 
     ctx
 }
@@ -87,12 +89,14 @@ async fn optimized_plan(ctx: &SessionContext, sql: &str) -> LogicalPlan {
 }
 
 fn contains_usearch_node(plan: &LogicalPlan) -> bool {
-    if let LogicalPlan::Extension(ext) = plan {
-        if ext.node.as_any().downcast_ref::<USearchNode>().is_some() {
-            return true;
-        }
+    if let LogicalPlan::Extension(ext) = plan
+        && ext.node.as_any().downcast_ref::<USearchNode>().is_some()
+    {
+        return true;
     }
-    plan.inputs().iter().any(|child| contains_usearch_node(child))
+    plan.inputs()
+        .iter()
+        .any(|child| contains_usearch_node(child))
 }
 
 const Q: &str = "ARRAY[0.1, 0.2, 0.3, 0.4]";
@@ -104,9 +108,7 @@ const Q: &str = "ARRAY[0.1, 0.2, 0.3, 0.4]";
 #[tokio::test]
 async fn test_l2sq_index_l2_udf_rewrites() {
     let ctx = make_ctx(MetricKind::L2sq).await;
-    let sql = format!(
-        "SELECT id, l2_distance(vector, {Q}) AS d FROM items ORDER BY d ASC LIMIT 5"
-    );
+    let sql = format!("SELECT id, l2_distance(vector, {Q}) AS d FROM items ORDER BY d ASC LIMIT 5");
     let plan = optimized_plan(&ctx, &sql).await;
     assert!(
         contains_usearch_node(&plan),
@@ -117,9 +119,8 @@ async fn test_l2sq_index_l2_udf_rewrites() {
 #[tokio::test]
 async fn test_cos_index_cosine_udf_rewrites() {
     let ctx = make_ctx(MetricKind::Cos).await;
-    let sql = format!(
-        "SELECT id, cosine_distance(vector, {Q}) AS d FROM items ORDER BY d ASC LIMIT 5"
-    );
+    let sql =
+        format!("SELECT id, cosine_distance(vector, {Q}) AS d FROM items ORDER BY d ASC LIMIT 5");
     let plan = optimized_plan(&ctx, &sql).await;
     assert!(
         contains_usearch_node(&plan),
@@ -147,9 +148,8 @@ async fn test_ip_index_negative_dot_udf_rewrites() {
 #[tokio::test]
 async fn test_l2sq_index_cosine_udf_no_rewrite() {
     let ctx = make_ctx(MetricKind::L2sq).await;
-    let sql = format!(
-        "SELECT id, cosine_distance(vector, {Q}) AS d FROM items ORDER BY d ASC LIMIT 5"
-    );
+    let sql =
+        format!("SELECT id, cosine_distance(vector, {Q}) AS d FROM items ORDER BY d ASC LIMIT 5");
     let plan = optimized_plan(&ctx, &sql).await;
     assert!(
         !contains_usearch_node(&plan),
@@ -173,9 +173,7 @@ async fn test_l2sq_index_negative_dot_udf_no_rewrite() {
 #[tokio::test]
 async fn test_cos_index_l2_udf_no_rewrite() {
     let ctx = make_ctx(MetricKind::Cos).await;
-    let sql = format!(
-        "SELECT id, l2_distance(vector, {Q}) AS d FROM items ORDER BY d ASC LIMIT 5"
-    );
+    let sql = format!("SELECT id, l2_distance(vector, {Q}) AS d FROM items ORDER BY d ASC LIMIT 5");
     let plan = optimized_plan(&ctx, &sql).await;
     assert!(
         !contains_usearch_node(&plan),
@@ -199,9 +197,7 @@ async fn test_cos_index_negative_dot_udf_no_rewrite() {
 #[tokio::test]
 async fn test_ip_index_l2_udf_no_rewrite() {
     let ctx = make_ctx(MetricKind::IP).await;
-    let sql = format!(
-        "SELECT id, l2_distance(vector, {Q}) AS d FROM items ORDER BY d ASC LIMIT 5"
-    );
+    let sql = format!("SELECT id, l2_distance(vector, {Q}) AS d FROM items ORDER BY d ASC LIMIT 5");
     let plan = optimized_plan(&ctx, &sql).await;
     assert!(
         !contains_usearch_node(&plan),
@@ -212,9 +208,8 @@ async fn test_ip_index_l2_udf_no_rewrite() {
 #[tokio::test]
 async fn test_ip_index_cosine_udf_no_rewrite() {
     let ctx = make_ctx(MetricKind::IP).await;
-    let sql = format!(
-        "SELECT id, cosine_distance(vector, {Q}) AS d FROM items ORDER BY d ASC LIMIT 5"
-    );
+    let sql =
+        format!("SELECT id, cosine_distance(vector, {Q}) AS d FROM items ORDER BY d ASC LIMIT 5");
     let plan = optimized_plan(&ctx, &sql).await;
     assert!(
         !contains_usearch_node(&plan),
@@ -259,9 +254,8 @@ async fn test_select_star_cosine_rewrites() {
 #[tokio::test]
 async fn test_desc_sort_no_rewrite() {
     let ctx = make_ctx(MetricKind::L2sq).await;
-    let sql = format!(
-        "SELECT id, l2_distance(vector, {Q}) AS d FROM items ORDER BY d DESC LIMIT 5"
-    );
+    let sql =
+        format!("SELECT id, l2_distance(vector, {Q}) AS d FROM items ORDER BY d DESC LIMIT 5");
     let plan = optimized_plan(&ctx, &sql).await;
     assert!(
         !contains_usearch_node(&plan),
@@ -294,9 +288,8 @@ async fn test_order_by_udf_direct_no_dist_in_select_rewrites() {
 #[tokio::test]
 async fn test_where_clause_absorbed_rewrites() {
     let ctx = make_ctx(MetricKind::L2sq).await;
-    let sql = format!(
-        "SELECT id FROM items WHERE id > 10 ORDER BY l2_distance(vector, {Q}) ASC LIMIT 5"
-    );
+    let sql =
+        format!("SELECT id FROM items WHERE id > 10 ORDER BY l2_distance(vector, {Q}) ASC LIMIT 5");
     let plan = optimized_plan(&ctx, &sql).await;
     assert!(
         contains_usearch_node(&plan),
@@ -363,7 +356,8 @@ async fn make_ctx_qualified(metric: MetricKind) -> SessionContext {
 
     let ctx = SessionContext::default();
     register_all(&ctx, registry).expect("register_all failed");
-    ctx.register_table("items", provider).expect("register_table failed");
+    ctx.register_table("items", provider)
+        .expect("register_table failed");
     ctx
 }
 

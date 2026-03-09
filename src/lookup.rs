@@ -11,8 +11,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, BooleanArray, Int32Array, Int64Array, RecordBatch,
-    UInt32Array, UInt64Array,
+    Array, BooleanArray, Int32Array, Int64Array, RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -100,11 +99,7 @@ impl HashKeyProvider {
     /// Scans every row once to populate the key index. Returns an error if
     /// `key_col` is not found in `schema` or if the column type is not one of
     /// `UInt64`, `Int64`, `UInt32`, `Int32`.
-    pub fn try_new(
-        schema: SchemaRef,
-        batches: Vec<RecordBatch>,
-        key_col: &str,
-    ) -> Result<Self> {
+    pub fn try_new(schema: SchemaRef, batches: Vec<RecordBatch>, key_col: &str) -> Result<Self> {
         let key_col_idx = schema.index_of(key_col).map_err(|_| {
             DataFusionError::Execution(format!(
                 "HashKeyProvider: key column '{key_col}' not found in schema"
@@ -121,16 +116,30 @@ impl HashKeyProvider {
             }
         }
 
-        Ok(Self { schema, batches, key_index, key_col: key_col.to_string() })
+        Ok(Self {
+            schema,
+            batches,
+            key_index,
+            key_col: key_col.to_string(),
+        })
     }
 
-    pub fn len(&self) -> usize { self.key_index.len() }
-    pub fn is_empty(&self) -> bool { self.key_index.is_empty() }
+    pub fn len(&self) -> usize {
+        self.key_index.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.key_index.is_empty()
+    }
 }
 
 impl fmt::Debug for HashKeyProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "HashKeyProvider(key_col={}, rows={})", self.key_col, self.key_index.len())
+        write!(
+            f,
+            "HashKeyProvider(key_col={}, rows={})",
+            self.key_col,
+            self.key_index.len()
+        )
     }
 }
 
@@ -147,7 +156,10 @@ impl PointLookupProvider for HashKeyProvider {
         }
 
         let mut batch_masks: Vec<Vec<bool>> = self
-            .batches.iter().map(|b| vec![false; b.num_rows()]).collect();
+            .batches
+            .iter()
+            .map(|b| vec![false; b.num_rows()])
+            .collect();
 
         for &key in keys {
             if let Some(&(batch_idx, row_idx)) = self.key_index.get(&key) {
@@ -158,10 +170,14 @@ impl PointLookupProvider for HashKeyProvider {
         let mut result: Vec<RecordBatch> = Vec::with_capacity(keys.len());
 
         for (batch, mask) in self.batches.iter().zip(batch_masks.iter()) {
-            if !mask.iter().any(|&b| b) { continue; }
+            if !mask.iter().any(|&b| b) {
+                continue;
+            }
 
             let bool_array = BooleanArray::from(mask.clone());
-            let filtered_cols: Vec<Arc<dyn Array>> = batch.columns().iter()
+            let filtered_cols: Vec<Arc<dyn Array>> = batch
+                .columns()
+                .iter()
                 .map(|col| {
                     compute::filter(col.as_ref(), &bool_array)
                         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
@@ -173,7 +189,8 @@ impl PointLookupProvider for HashKeyProvider {
 
             let out = match projection {
                 None => filtered,
-                Some(indices) => filtered.project(indices)
+                Some(indices) => filtered
+                    .project(indices)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
             };
 
@@ -186,9 +203,15 @@ impl PointLookupProvider for HashKeyProvider {
 
 #[async_trait]
 impl TableProvider for HashKeyProvider {
-    fn as_any(&self) -> &dyn Any { self }
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
-    fn table_type(&self) -> TableType { TableType::Base }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
 
     async fn scan(
         &self,
@@ -207,22 +230,46 @@ impl TableProvider for HashKeyProvider {
 pub(crate) fn extract_keys_as_u64(col: &dyn Array) -> Result<Vec<Option<u64>>> {
     if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
         return Ok((0..arr.len())
-            .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i))
+                }
+            })
             .collect());
     }
     if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
         return Ok((0..arr.len())
-            .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i) as u64) })
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i) as u64)
+                }
+            })
             .collect());
     }
     if let Some(arr) = col.as_any().downcast_ref::<UInt32Array>() {
         return Ok((0..arr.len())
-            .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i) as u64) })
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i) as u64)
+                }
+            })
             .collect());
     }
     if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
         return Ok((0..arr.len())
-            .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i) as u64) })
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i) as u64)
+                }
+            })
             .collect());
     }
     Err(DataFusionError::Execution(format!(

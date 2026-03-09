@@ -56,18 +56,32 @@ impl USearchNode {
         filters: Vec<Expr>,
     ) -> Self {
         let query_vec_bits = query_vec.iter().map(|v| v.to_bits()).collect();
-        Self { table_name, vector_col, query_vec_bits, k, distance_type, schema, filters }
+        Self {
+            table_name,
+            vector_col,
+            query_vec_bits,
+            k,
+            distance_type,
+            schema,
+            filters,
+        }
     }
 
     /// Returns the query vector as `f64`, preserving SQL literal precision.
     pub fn query_vec_f64(&self) -> Vec<f64> {
-        self.query_vec_bits.iter().map(|b| f64::from_bits(*b)).collect()
+        self.query_vec_bits
+            .iter()
+            .map(|b| f64::from_bits(*b))
+            .collect()
     }
 
     /// Returns the query vector as `f32` (cast from f64).
     /// Use for F32-indexed tables or when f32 precision is sufficient.
     pub fn query_vec(&self) -> Vec<f32> {
-        self.query_vec_bits.iter().map(|b| f64::from_bits(*b) as f32).collect()
+        self.query_vec_bits
+            .iter()
+            .map(|b| f64::from_bits(*b) as f32)
+            .collect()
     }
 }
 
@@ -107,13 +121,21 @@ impl Hash for USearchNode {
 }
 
 impl UserDefinedLogicalNodeCore for USearchNode {
-    fn name(&self) -> &str { "USearch" }
+    fn name(&self) -> &str {
+        "USearch"
+    }
 
-    fn inputs(&self) -> Vec<&LogicalPlan> { vec![] }
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![]
+    }
 
-    fn schema(&self) -> &DFSchemaRef { &self.schema }
+    fn schema(&self) -> &DFSchemaRef {
+        &self.schema
+    }
 
-    fn expressions(&self) -> Vec<Expr> { vec![] }
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(

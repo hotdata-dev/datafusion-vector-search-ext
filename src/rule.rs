@@ -28,8 +28,8 @@ use std::sync::Arc;
 use arrow_array::Array;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{DFSchema, Result, TableReference};
-use datafusion::logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNode, col};
 use datafusion::logical_expr::logical_plan::Projection;
+use datafusion::logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNode, col};
 use datafusion::optimizer::OptimizerConfig;
 
 use usearch::MetricKind;
@@ -66,9 +66,12 @@ impl USearchRule {
         // Deeper nesting (Filter→Filter→…) is not absorbed — the rule does
         // not fire and DataFusion falls back to exact execution.
         let (table_ref_full, _table_name_bare, scan_table_ref, filters) = match after_sort {
-            LogicalPlan::TableScan(TableScan { table_name, .. }) => {
-                (table_ref_to_str(table_name), table_name.table().to_string(), table_name.clone(), vec![])
-            }
+            LogicalPlan::TableScan(TableScan { table_name, .. }) => (
+                table_ref_to_str(table_name),
+                table_name.table().to_string(),
+                table_name.clone(),
+                vec![],
+            ),
             LogicalPlan::Filter(f) => match f.input.as_ref() {
                 LogicalPlan::TableScan(TableScan { table_name, .. }) => (
                     table_ref_to_str(table_name),
@@ -120,14 +123,18 @@ impl USearchRule {
         // Build USearchNode schema: base fields qualified with the original table
         // reference (Full/Partial/Bare) so qualifiers match the original plan's schema.
         let table_ref = scan_table_ref.clone();
-        let qualified_fields: Vec<(Option<TableReference>, Arc<arrow_schema::Field>)> =
-            registered.schema.fields().iter().map(|f| {
+        let qualified_fields: Vec<(Option<TableReference>, Arc<arrow_schema::Field>)> = registered
+            .schema
+            .fields()
+            .iter()
+            .map(|f| {
                 if f.name() == "_distance" {
                     (None, f.clone())
                 } else {
                     (Some(table_ref.clone()), f.clone())
                 }
-            }).collect();
+            })
+            .collect();
         let vsn_df_schema = DFSchema::new_with_metadata(qualified_fields, HashMap::new()).ok()?;
 
         let node = USearchNode::new(
@@ -156,11 +163,13 @@ impl USearchRule {
         // Keep the Sort node so DataFusion handles ordering by _distance / dist.
         // USearch returns results in arbitrary (internal) order when the underlying
         // data is fetched from the TableProvider.
-        Some(LogicalPlan::Sort(datafusion::logical_expr::logical_plan::Sort {
-            expr: sort.expr.clone(),
-            input: Arc::new(LogicalPlan::Projection(new_proj)),
-            fetch: sort.fetch,
-        }))
+        Some(LogicalPlan::Sort(
+            datafusion::logical_expr::logical_plan::Sort {
+                expr: sort.expr.clone(),
+                input: Arc::new(LogicalPlan::Projection(new_proj)),
+                fetch: sort.fetch,
+            },
+        ))
     }
 }
 
@@ -171,13 +180,17 @@ impl std::fmt::Debug for USearchRule {
 }
 
 impl datafusion::optimizer::OptimizerRule for USearchRule {
-    fn name(&self) -> &str { "usearch_rule" }
+    fn name(&self) -> &str {
+        "usearch_rule"
+    }
 
     fn apply_order(&self) -> Option<datafusion::optimizer::ApplyOrder> {
         Some(datafusion::optimizer::ApplyOrder::TopDown)
     }
 
-    fn supports_rewrite(&self) -> bool { true }
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
 
     fn rewrite(
         &self,
@@ -198,7 +211,11 @@ impl datafusion::optimizer::OptimizerRule for USearchRule {
 /// Used as the prefix for registry keys: `"catalog::schema::table::col"`.
 fn table_ref_to_str(r: &TableReference) -> String {
     match r {
-        TableReference::Full { catalog, schema, table } => {
+        TableReference::Full {
+            catalog,
+            schema,
+            table,
+        } => {
             format!("{}::{}::{}", catalog, schema, table)
         }
         TableReference::Partial { schema, table } => format!("{}::{}", schema, table),
@@ -215,18 +232,18 @@ fn find_distance_info(
     if let Some(info) = try_extract_distance(expr) {
         return Some(info);
     }
-    if let Expr::Column(col_ref) = expr {
-        if let Some(projs) = proj_exprs {
-            for proj in projs {
-                let (alias_name, inner_expr): (Option<&str>, &Expr) = match proj {
-                    Expr::Alias(a) => (Some(a.name.as_str()), a.expr.as_ref()),
-                    other => (None, other),
-                };
-                if alias_name.map_or(false, |n| n == col_ref.name.as_str()) {
-                    if let Some(info) = try_extract_distance(inner_expr) {
-                        return Some(info);
-                    }
-                }
+    if let Expr::Column(col_ref) = expr
+        && let Some(projs) = proj_exprs
+    {
+        for proj in projs {
+            let (alias_name, inner_expr): (Option<&str>, &Expr) = match proj {
+                Expr::Alias(a) => (Some(a.name.as_str()), a.expr.as_ref()),
+                other => (None, other),
+            };
+            if alias_name == Some(col_ref.name.as_str())
+                && let Some(info) = try_extract_distance(inner_expr)
+            {
+                return Some(info);
             }
         }
     }
@@ -248,7 +265,10 @@ fn extract_alias_name(sort_expr: &Expr, proj_exprs: &[Expr]) -> Option<String> {
 }
 
 fn is_dist_udf_name(name: &str) -> bool {
-    matches!(name, "l2_distance" | "cosine_distance" | "negative_dot_product")
+    matches!(
+        name,
+        "l2_distance" | "cosine_distance" | "negative_dot_product"
+    )
 }
 
 /// Returns true if the SQL distance function matches the metric the index was built with.
@@ -276,8 +296,12 @@ fn try_extract_distance(expr: &Expr) -> Option<(String, String, Vec<f64>)> {
         _ => return None,
     };
     let udf_name = sf.func.name().to_string();
-    if !is_dist_udf_name(&udf_name) { return None; }
-    if sf.args.len() < 2 { return None; }
+    if !is_dist_udf_name(&udf_name) {
+        return None;
+    }
+    if sf.args.len() < 2 {
+        return None;
+    }
 
     let vec_col = match &sf.args[0] {
         Expr::Column(c) => c.name.clone(),
@@ -287,8 +311,15 @@ fn try_extract_distance(expr: &Expr) -> Option<(String, String, Vec<f64>)> {
     Some((udf_name, vec_col, query_vec))
 }
 
-fn remap_projections(proj_exprs: &[Expr], dist_alias_name: &str, table_ref: &TableReference) -> Vec<Expr> {
-    proj_exprs.iter().map(|e| remap_one(e, dist_alias_name, table_ref)).collect()
+fn remap_projections(
+    proj_exprs: &[Expr],
+    dist_alias_name: &str,
+    table_ref: &TableReference,
+) -> Vec<Expr> {
+    proj_exprs
+        .iter()
+        .map(|e| remap_one(e, dist_alias_name, table_ref))
+        .collect()
 }
 
 /// Build a passthrough Projection for SELECT * queries (no original Projection node).
@@ -296,11 +327,17 @@ fn remap_projections(proj_exprs: &[Expr], dist_alias_name: &str, table_ref: &Tab
 /// matches the original Sort schema. The Sort re-evaluates the distance UDF expression
 /// on the k result rows returned by USearchExec (O(k × dim), negligible for small k).
 fn passthrough_projection(schema: &DFSchema, table_ref: &TableReference) -> Vec<Expr> {
-    schema.inner().fields().iter()
+    schema
+        .inner()
+        .fields()
+        .iter()
         .filter(|f| f.name() != "_distance")
-        .map(|f| Expr::Column(datafusion::common::Column::new(
-            Some(table_ref.clone()), f.name().as_str()
-        )))
+        .map(|f| {
+            Expr::Column(datafusion::common::Column::new(
+                Some(table_ref.clone()),
+                f.name().as_str(),
+            ))
+        })
         .collect()
 }
 
@@ -309,19 +346,18 @@ fn remap_one(expr: &Expr, dist_alias_name: &str, table_ref: &TableReference) -> 
         Expr::Alias(a) if a.name == dist_alias_name && is_distance_expr(&a.expr) => {
             col("_distance").alias(a.name.as_str())
         }
-        Expr::Alias(a) if is_distance_expr(&a.expr) => {
-            col("_distance").alias(a.name.as_str())
-        }
+        Expr::Alias(a) if is_distance_expr(&a.expr) => col("_distance").alias(a.name.as_str()),
         Expr::Alias(a) => match a.expr.as_ref() {
-            Expr::Column(c) => {
-                Expr::Column(datafusion::common::Column::new(
-                    Some(table_ref.clone()), c.name.as_str()
-                )).alias(a.name.as_str())
-            }
+            Expr::Column(c) => Expr::Column(datafusion::common::Column::new(
+                Some(table_ref.clone()),
+                c.name.as_str(),
+            ))
+            .alias(a.name.as_str()),
             _ => col(a.name.as_str()),
         },
         Expr::Column(c) => Expr::Column(datafusion::common::Column::new(
-            Some(table_ref.clone()), c.name.as_str()
+            Some(table_ref.clone()),
+            c.name.as_str(),
         )),
         Expr::ScalarFunction(sf) if is_dist_udf_name(sf.func.name()) => col("_distance"),
         other => other.clone(),
@@ -341,7 +377,9 @@ fn extract_f64_vec_from_expr(expr: &Expr) -> Option<Vec<f64>> {
         // DataFusion 51: Expr::Literal is (ScalarValue, Option<FieldMetadata>)
         Expr::Literal(sv, _) => match sv {
             ScalarValue::FixedSizeList(arr) => {
-                if arr.is_empty() { return None; }
+                if arr.is_empty() {
+                    return None;
+                }
                 let inner = arr.value(0);
                 if let Some(f64a) = inner.as_any().downcast_ref::<Float64Array>() {
                     return Some(f64a.values().to_vec());
@@ -352,7 +390,9 @@ fn extract_f64_vec_from_expr(expr: &Expr) -> Option<Vec<f64>> {
                 None
             }
             ScalarValue::List(arr) => {
-                if arr.is_empty() { return None; }
+                if arr.is_empty() {
+                    return None;
+                }
                 let inner = arr.value(0);
                 if let Some(f64a) = inner.as_any().downcast_ref::<Float64Array>() {
                     return Some(f64a.values().to_vec());
@@ -364,9 +404,7 @@ fn extract_f64_vec_from_expr(expr: &Expr) -> Option<Vec<f64>> {
             }
             _ => None,
         },
-        Expr::ScalarFunction(sf)
-            if sf.func.name() == "make_array" || sf.func.name() == "array" =>
-        {
+        Expr::ScalarFunction(sf) if sf.func.name() == "make_array" || sf.func.name() == "array" => {
             let mut result = Vec::with_capacity(sf.args.len());
             for arg in &sf.args {
                 match arg {

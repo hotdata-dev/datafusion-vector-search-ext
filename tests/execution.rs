@@ -18,10 +18,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    FixedSizeListArray, RecordBatch, StringArray, UInt64Array,
-};
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+use arrow_array::{FixedSizeListArray, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
@@ -39,10 +37,7 @@ fn exec_schema() -> Arc<Schema> {
         Field::new("label", DataType::Utf8, false),
         Field::new(
             "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                4,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
             false,
         ),
     ]))
@@ -69,11 +64,7 @@ fn test_batch(schema: &Arc<Schema>) -> RecordBatch {
 
     RecordBatch::try_new(
         schema.clone(),
-        vec![
-            Arc::new(ids),
-            Arc::new(labels),
-            Arc::new(vector_col),
-        ],
+        vec![Arc::new(ids), Arc::new(labels), Arc::new(vector_col)],
     )
     .expect("test_batch build failed")
 }
@@ -128,7 +119,8 @@ async fn make_exec_ctx(reg_key: &str) -> SessionContext {
         .build();
     let ctx = SessionContext::new_with_state(state);
     register_all(&ctx, registry).expect("register_all");
-    ctx.register_table("items", provider).expect("register_table");
+    ctx.register_table("items", provider)
+        .expect("register_table");
     ctx
 }
 
@@ -171,16 +163,18 @@ async fn exec_order_by_udf_bare() {
     let ctx = make_exec_ctx("items::vector").await;
     let sql = format!("SELECT id FROM items ORDER BY l2_distance(vector, {Q}) ASC LIMIT 2");
     let ids = collect_ids(&ctx, &sql).await;
-    assert_eq!(ids[0], 1, "closest to [1,0,0,0] must be row 1\nids: {ids:?}");
+    assert_eq!(
+        ids[0], 1,
+        "closest to [1,0,0,0] must be row 1\nids: {ids:?}"
+    );
 }
 
 /// Alias in ORDER BY, bare table.
 #[tokio::test]
 async fn exec_order_by_alias_bare() {
     let ctx = make_exec_ctx("items::vector").await;
-    let sql = format!(
-        "SELECT id, l2_distance(vector, {Q}) AS dist FROM items ORDER BY dist ASC LIMIT 2"
-    );
+    let sql =
+        format!("SELECT id, l2_distance(vector, {Q}) AS dist FROM items ORDER BY dist ASC LIMIT 2");
     let ids = collect_ids(&ctx, &sql).await;
     assert_eq!(ids[0], 1, "closest must be row 1\nids: {ids:?}");
 }
@@ -199,8 +193,14 @@ async fn exec_where_clause_bare() {
     );
     let ids = collect_ids(&ctx, &sql).await;
     assert!(ids.contains(&2), "row 2 (beta) must appear; got {ids:?}");
-    assert!(!ids.contains(&1), "row 1 (alpha) must be filtered out; got {ids:?}");
-    assert!(!ids.contains(&4), "row 4 (alpha) must be filtered out; got {ids:?}");
+    assert!(
+        !ids.contains(&1),
+        "row 1 (alpha) must be filtered out; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&4),
+        "row 4 (alpha) must be filtered out; got {ids:?}"
+    );
 }
 
 /// WHERE clause with alias in ORDER BY, bare table.
@@ -238,7 +238,10 @@ async fn exec_qualified_subquery_where_order_by_alias() {
     );
     let ids = collect_ids(&ctx, &sql).await;
     assert!(ids.contains(&2), "row 2 (beta) must appear; got {ids:?}");
-    assert!(!ids.contains(&1), "row 1 (alpha) must be filtered; got {ids:?}");
+    assert!(
+        !ids.contains(&1),
+        "row 1 (alpha) must be filtered; got {ids:?}"
+    );
 }
 
 /// Simpler form: qualified table, WHERE clause, ORDER BY alias inline.
@@ -263,5 +266,8 @@ async fn exec_qualified_where_order_by_udf() {
     );
     let ids = collect_ids(&ctx, &sql).await;
     assert!(ids.contains(&2), "row 2 (beta) must appear; got {ids:?}");
-    assert!(!ids.contains(&1), "row 1 (alpha) must be filtered; got {ids:?}");
+    assert!(
+        !ids.contains(&1),
+        "row 1 (alpha) must be filtered; got {ids:?}"
+    );
 }

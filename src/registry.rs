@@ -68,7 +68,11 @@ impl USearchIndexConfig {
     /// Create a config for the given dimensions and metric, with all other
     /// parameters set to their defaults (M=16, ef_construction=128, F32).
     pub fn new(dimensions: usize, metric: MetricKind) -> Self {
-        Self { dimensions, metric, ..Self::default() }
+        Self {
+            dimensions,
+            metric,
+            ..Self::default()
+        }
     }
 
     /// Build a new, empty USearch index with these parameters.
@@ -89,7 +93,8 @@ impl USearchIndexConfig {
     pub fn load_index(&self, path: &str) -> Result<Index> {
         let index = Index::new(&self.to_index_options())
             .map_err(|e| DataFusionError::Execution(format!("USearch Index::new failed: {e}")))?;
-        index.load(path)
+        index
+            .load(path)
             .map_err(|e| DataFusionError::Execution(format!("USearch index load failed: {e}")))?;
         Ok(index)
     }
@@ -190,7 +195,9 @@ pub struct USearchRegistry {
 
 impl USearchRegistry {
     pub fn new() -> Self {
-        Self { tables: RwLock::new(HashMap::new()) }
+        Self {
+            tables: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Register a USearch index with default query configuration.
@@ -220,13 +227,22 @@ impl USearchRegistry {
         metric: MetricKind,
         scalar_kind: ScalarKind,
     ) -> Result<()> {
-        self.add_with_config(name, index, provider, key_col, metric, scalar_kind, USearchTableConfig::default())
+        self.add_with_config(
+            name,
+            index,
+            provider,
+            key_col,
+            metric,
+            scalar_kind,
+            USearchTableConfig::default(),
+        )
     }
 
     /// Register a USearch index with explicit query configuration.
     ///
     /// Sets `ef_search` on the index exactly once before storing it.
     /// Do not call `index.change_expansion_search()` after this point.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_with_config(
         &self,
         name: &str,
@@ -248,8 +264,11 @@ impl USearchRegistry {
             ))
         })?;
 
-        let mut fields: Vec<Field> =
-            data_schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut fields: Vec<Field> = data_schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
         fields.push(Field::new("_distance", DataType::Float32, true));
         let schema = Arc::new(Schema::new(fields));
 
@@ -299,5 +318,7 @@ impl USearchRegistry {
 }
 
 impl Default for USearchRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

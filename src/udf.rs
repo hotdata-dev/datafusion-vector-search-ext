@@ -10,7 +10,9 @@ use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray};
+use arrow_array::{
+    Array, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray,
+};
 use arrow_schema::DataType;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{
@@ -21,7 +23,11 @@ use datafusion::scalar::ScalarValue;
 type Kernel = fn(&[f32], &[f32]) -> f32;
 
 fn l2_kernel(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f32>()
+        .sqrt()
 }
 
 fn cosine_kernel(a: &[f32], b: &[f32]) -> f32 {
@@ -45,7 +51,11 @@ pub struct DistanceUDF {
 impl DistanceUDF {
     fn new(name: &str, kernel: Kernel) -> Self {
         let signature = Signature::new(TypeSignature::VariadicAny, Volatility::Immutable);
-        Self { name: name.to_string(), signature, kernel }
+        Self {
+            name: name.to_string(),
+            signature,
+            kernel,
+        }
     }
 }
 
@@ -56,17 +66,27 @@ impl std::fmt::Debug for DistanceUDF {
 }
 
 impl PartialEq for DistanceUDF {
-    fn eq(&self, other: &Self) -> bool { self.name == other.name }
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
 }
 impl Eq for DistanceUDF {}
 impl Hash for DistanceUDF {
-    fn hash<H: Hasher>(&self, state: &mut H) { self.name.hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
 }
 
 impl ScalarUDFImpl for DistanceUDF {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &str { &self.name }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Float32)
     }
@@ -94,7 +114,9 @@ impl ScalarUDFImpl for DistanceUDF {
         let name = &self.name;
         let distances = compute_distances(&vec_col, &query_vec, kernel, name)?;
 
-        Ok(ColumnarValue::Array(Arc::new(Float32Array::from(distances))))
+        Ok(ColumnarValue::Array(Arc::new(Float32Array::from(
+            distances,
+        ))))
     }
 }
 
@@ -221,6 +243,12 @@ fn scalar_to_f32_vec(sv: &ScalarValue) -> Result<Vec<f32>> {
     }
 }
 
-pub fn l2_distance_udf() -> DistanceUDF { DistanceUDF::new("l2_distance", l2_kernel) }
-pub fn cosine_distance_udf() -> DistanceUDF { DistanceUDF::new("cosine_distance", cosine_kernel) }
-pub fn negative_dot_product_udf() -> DistanceUDF { DistanceUDF::new("negative_dot_product", negative_dot_kernel) }
+pub fn l2_distance_udf() -> DistanceUDF {
+    DistanceUDF::new("l2_distance", l2_kernel)
+}
+pub fn cosine_distance_udf() -> DistanceUDF {
+    DistanceUDF::new("cosine_distance", cosine_kernel)
+}
+pub fn negative_dot_product_udf() -> DistanceUDF {
+    DistanceUDF::new("negative_dot_product", negative_dot_kernel)
+}

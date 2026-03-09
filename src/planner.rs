@@ -28,22 +28,24 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_array::{Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, ListArray, LargeListArray, RecordBatch};
+use arrow_array::{
+    Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray,
+    RecordBatch,
+};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
+use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, create_physical_expr};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Partitioning,
-    collect,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, collect,
     memory::MemoryStream,
 };
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
-use datafusion::execution::context::QueryPlanner;
 
 use usearch::ScalarKind;
 
@@ -67,9 +69,9 @@ impl fmt::Debug for USearchQueryPlanner {
 
 impl USearchQueryPlanner {
     pub fn new(registry: Arc<USearchRegistry>) -> Self {
-        let inner = DefaultPhysicalPlanner::with_extension_planners(vec![
-            Arc::new(USearchExecPlanner::new(registry)),
-        ]);
+        let inner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
+            USearchExecPlanner::new(registry),
+        )]);
         Self { inner }
     }
 }
@@ -81,7 +83,9 @@ impl QueryPlanner for USearchQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.inner.create_physical_plan(logical_plan, session_state).await
+        self.inner
+            .create_physical_plan(logical_plan, session_state)
+            .await
     }
 }
 
@@ -118,7 +122,7 @@ impl ExtensionPlanner for USearchExecPlanner {
                 return Err(DataFusionError::Execution(format!(
                     "USearchExecPlanner: table '{}' not in registry",
                     node.table_name
-                )))
+                )));
             }
         };
 
@@ -126,7 +130,12 @@ impl ExtensionPlanner for USearchExecPlanner {
 
         if node.filters.is_empty() {
             // ── Unfiltered path (original behaviour) ─────────────────────────
-            let matches = usearch_search(&registered.index, &query_f64, node.k, registered.scalar_kind)?;
+            let matches = usearch_search(
+                &registered.index,
+                &query_f64,
+                node.k,
+                registered.scalar_kind,
+            )?;
 
             if matches.keys.is_empty() {
                 return Ok(Some(Arc::new(USearchExec::new(
@@ -137,7 +146,9 @@ impl ExtensionPlanner for USearchExecPlanner {
             }
 
             let key_to_dist: HashMap<u64, f32> = matches
-                .keys.iter().zip(matches.distances.iter())
+                .keys
+                .iter()
+                .zip(matches.distances.iter())
                 .map(|(&k, &d)| (k, d))
                 .collect();
 
@@ -194,7 +205,9 @@ async fn adaptive_filtered_exec(
     // same field ordering as the provider batches (data columns first, then
     // _distance at the end), so column indices resolve correctly at eval time.
     let exec_props = session_state.execution_props();
-    let physical_filters: Vec<Arc<dyn PhysicalExpr>> = node.filters.iter()
+    let physical_filters: Vec<Arc<dyn PhysicalExpr>> = node
+        .filters
+        .iter()
         .map(|f| create_physical_expr(f, &node.schema, exec_props))
         .collect::<Result<_>>()?;
 
@@ -204,7 +217,8 @@ async fn adaptive_filtered_exec(
 
     // Full scan of the provider.  For HashKeyProvider this is an in-memory
     // pass; for on-disk providers it triggers real I/O.
-    let scan_plan = registered.provider
+    let scan_plan = registered
+        .provider
         .scan(session_state, None, &[], None)
         .await?;
     let task_ctx = session_state.task_ctx();
@@ -223,18 +237,24 @@ async fn adaptive_filtered_exec(
         let keys = extract_keys_as_u64(batch.column(key_col_idx).as_ref())?;
 
         for row_idx in 0..batch.num_rows() {
-            if !mask.is_null(row_idx) && mask.value(row_idx) {
-                if let Some(Some(key)) = keys.get(row_idx) {
-                    let key = *key;
-                    valid_keys.insert(key);
+            if !mask.is_null(row_idx)
+                && mask.value(row_idx)
+                && let Some(Some(key)) = keys.get(row_idx)
+            {
+                let key = *key;
+                valid_keys.insert(key);
 
-                    if let Some(vi) = vec_col_idx {
-                        if let Ok(dist) = compute_distance_for_row(
-                            batch, vi, row_idx, query, registered.scalar_kind, &node.distance_type,
-                        ) {
-                            key_distances.push((key, dist));
-                        }
-                    }
+                if let Some(vi) = vec_col_idx
+                    && let Ok(dist) = compute_distance_for_row(
+                        batch,
+                        vi,
+                        row_idx,
+                        query,
+                        registered.scalar_kind,
+                        &node.distance_type,
+                    )
+                {
+                    key_distances.push((key, dist));
                 }
             }
         }
@@ -294,7 +314,10 @@ async fn adaptive_filtered_exec(
         let result_batches =
             attach_distances(data_batches, key_col_idx, &key_to_dist, &registered.schema)?;
 
-        tracing::Span::current().record("usearch.result_count", result_batches.iter().map(|b| b.num_rows()).sum::<usize>());
+        tracing::Span::current().record(
+            "usearch.result_count",
+            result_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        );
         Ok(Some(Arc::new(USearchExec::new(
             node.table_name.clone(),
             registered.schema.clone(),
@@ -307,11 +330,17 @@ async fn adaptive_filtered_exec(
         // don't satisfy the WHERE clause.  The graph keeps exploring until k
         // passing candidates are found — always returning exactly k results
         // (or fewer if the valid set has < k members).
-        let matches = tracing::info_span!("usearch_hnsw_filtered_search", usearch.table = %node.table_name)
-            .in_scope(|| usearch_filtered_search(
-                &registered.index, query, node.k, registered.scalar_kind,
-                |key| valid_keys.contains(&key),
-            ))?;
+        let matches =
+            tracing::info_span!("usearch_hnsw_filtered_search", usearch.table = %node.table_name)
+                .in_scope(|| {
+                usearch_filtered_search(
+                    &registered.index,
+                    query,
+                    node.k,
+                    registered.scalar_kind,
+                    |key| valid_keys.contains(&key),
+                )
+            })?;
 
         if matches.keys.is_empty() {
             tracing::Span::current().record("usearch.result_count", 0usize);
@@ -323,7 +352,9 @@ async fn adaptive_filtered_exec(
         }
 
         let key_to_dist: HashMap<u64, f32> = matches
-            .keys.iter().zip(matches.distances.iter())
+            .keys
+            .iter()
+            .zip(matches.distances.iter())
             .map(|(&k, &d)| (k, d))
             .collect();
 
@@ -335,7 +366,10 @@ async fn adaptive_filtered_exec(
         let result_batches =
             attach_distances(data_batches, key_col_idx, &key_to_dist, &registered.schema)?;
 
-        tracing::Span::current().record("usearch.result_count", result_batches.iter().map(|b| b.num_rows()).sum::<usize>());
+        tracing::Span::current().record(
+            "usearch.result_count",
+            result_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        );
         Ok(Some(Arc::new(USearchExec::new(
             node.table_name.clone(),
             registered.schema.clone(),
@@ -355,11 +389,13 @@ fn usearch_search(
     scalar_kind: ScalarKind,
 ) -> Result<usearch::ffi::Matches> {
     match scalar_kind {
-        ScalarKind::F64 => index.search(query_f64, k)
+        ScalarKind::F64 => index
+            .search(query_f64, k)
             .map_err(|e| DataFusionError::Execution(format!("USearch search error: {e}"))),
         _ => {
             let q: Vec<f32> = query_f64.iter().map(|&v| v as f32).collect();
-            index.search(&q, k)
+            index
+                .search(&q, k)
                 .map_err(|e| DataFusionError::Execution(format!("USearch search error: {e}")))
         }
     }
@@ -378,11 +414,13 @@ where
     F: Fn(u64) -> bool,
 {
     match scalar_kind {
-        ScalarKind::F64 => index.filtered_search(query_f64, k, predicate)
+        ScalarKind::F64 => index
+            .filtered_search(query_f64, k, predicate)
             .map_err(|e| DataFusionError::Execution(format!("USearch filtered_search: {e}"))),
         _ => {
             let q: Vec<f32> = query_f64.iter().map(|&v| v as f32).collect();
-            index.filtered_search(&q, k, predicate)
+            index
+                .filtered_search(&q, k, predicate)
                 .map_err(|e| DataFusionError::Execution(format!("USearch filtered_search: {e}")))
         }
     }
@@ -446,29 +484,37 @@ fn compute_distance_for_row(
     }
 
     // Extract the row's inner array, regardless of outer type.
-    let row_arr: Arc<dyn Array> = if let Some(fsl) = col.as_any().downcast_ref::<FixedSizeListArray>() {
-        fsl.value(row_idx)
-    } else if let Some(la) = col.as_any().downcast_ref::<ListArray>() {
-        la.value(row_idx)
-    } else if let Some(la) = col.as_any().downcast_ref::<LargeListArray>() {
-        la.value(row_idx)
-    } else {
-        return Err(DataFusionError::Execution(format!(
-            "vector column type not supported in brute-force path (got {:?})",
-            col.data_type()
-        )));
-    };
+    let row_arr: Arc<dyn Array> =
+        if let Some(fsl) = col.as_any().downcast_ref::<FixedSizeListArray>() {
+            fsl.value(row_idx)
+        } else if let Some(la) = col.as_any().downcast_ref::<ListArray>() {
+            la.value(row_idx)
+        } else if let Some(la) = col.as_any().downcast_ref::<LargeListArray>() {
+            la.value(row_idx)
+        } else {
+            return Err(DataFusionError::Execution(format!(
+                "vector column type not supported in brute-force path (got {:?})",
+                col.data_type()
+            )));
+        };
 
     // Dispatch distance computation by the column's native element type.
     match scalar_kind {
         ScalarKind::F64 => {
-            let f64_arr = row_arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-                DataFusionError::Execution("F64 column: inner array is not Float64Array".into())
-            })?;
+            let f64_arr = row_arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("F64 column: inner array is not Float64Array".into())
+                })?;
             let v = f64_arr.values();
             let query = query_f64;
             let dist = match dist_type {
-                DistanceType::L2 => v.iter().zip(query).map(|(a, b)| (a - b) * (a - b)).sum::<f64>(),
+                DistanceType::L2 => v
+                    .iter()
+                    .zip(query)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f64>(),
                 DistanceType::Cosine => {
                     let dot: f64 = v.iter().zip(query).map(|(a, b)| a * b).sum();
                     let norm_v: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -482,17 +528,24 @@ fn compute_distance_for_row(
         }
         _ => {
             // F32 (and any other kind): extract as f32, cast query to f32.
-            let f32_arr = row_arr.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "F32 column: inner array is not Float32Array (got {:?})",
-                    row_arr.data_type()
-                ))
-            })?;
+            let f32_arr = row_arr
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "F32 column: inner array is not Float32Array (got {:?})",
+                        row_arr.data_type()
+                    ))
+                })?;
             let v = f32_arr.values();
             let query: Vec<f32> = query_f64.iter().map(|&x| x as f32).collect();
             let dist = match dist_type {
                 // L2sq — matches USearch MetricKind::L2sq (no sqrt).
-                DistanceType::L2 => v.iter().zip(&query).map(|(a, b)| (a - b) * (a - b)).sum::<f32>(),
+                DistanceType::L2 => v
+                    .iter()
+                    .zip(&query)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f32>(),
                 // Cosine distance = 1 - cosine_similarity.
                 DistanceType::Cosine => {
                     let dot: f32 = v.iter().zip(&query).map(|(a, b)| a * b).sum();
@@ -513,10 +566,10 @@ fn compute_distance_for_row(
 /// max-heap of size k.  Returns pairs sorted ascending by distance.
 ///
 /// `pairs` is consumed (sorted in place) to avoid an extra allocation.
-fn heap_select_top_k(pairs: &mut Vec<(u64, f32)>, k: usize) -> Vec<(u64, f32)> {
+fn heap_select_top_k(pairs: &mut [(u64, f32)], k: usize) -> Vec<(u64, f32)> {
     if pairs.len() <= k {
         pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        return pairs.clone();
+        return pairs.to_owned();
     }
 
     // Max-heap: store (OrderedFloat, key).  Pop the largest when size > k.
@@ -534,7 +587,9 @@ fn heap_select_top_k(pairs: &mut Vec<(u64, f32)>, k: usize) -> Vec<(u64, f32)> {
     impl Ord for HeapEntry {
         fn cmp(&self, other: &Self) -> std::cmp::Ordering {
             // NaN sorts to the top of the heap so it gets evicted first.
-            self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Less)
+            self.0
+                .partial_cmp(&other.0)
+                .unwrap_or(std::cmp::Ordering::Less)
         }
     }
 
@@ -553,12 +608,16 @@ fn heap_select_top_k(pairs: &mut Vec<(u64, f32)>, k: usize) -> Vec<(u64, f32)> {
 
 /// Index of the key column in the provider schema.
 fn provider_key_col_idx(registered: &crate::registry::RegisteredTable) -> Result<usize> {
-    registered.provider.schema().index_of(&registered.key_col).map_err(|_| {
-        DataFusionError::Execution(format!(
-            "USearchExecPlanner: key column '{}' not found in provider schema",
-            registered.key_col
-        ))
-    })
+    registered
+        .provider
+        .schema()
+        .index_of(&registered.key_col)
+        .map_err(|_| {
+            DataFusionError::Execution(format!(
+                "USearchExecPlanner: key column '{}' not found in provider schema",
+                registered.key_col
+            ))
+        })
 }
 
 // ── Distance attachment ───────────────────────────────────────────────────────
@@ -610,7 +669,12 @@ impl USearchExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
-        Self { label, schema, batches: Arc::new(batches), properties }
+        Self {
+            label,
+            schema,
+            batches: Arc::new(batches),
+            properties,
+        }
     }
 }
 
@@ -621,10 +685,18 @@ impl DisplayAs for USearchExec {
 }
 
 impl ExecutionPlan for USearchExec {
-    fn name(&self) -> &str { "USearchExec" }
-    fn as_any(&self) -> &dyn Any { self }
-    fn properties(&self) -> &PlanProperties { &self.properties }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
+    fn name(&self) -> &str {
+        "USearchExec"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
 
     fn with_new_children(
         self: Arc<Self>,
@@ -645,6 +717,10 @@ impl ExecutionPlan for USearchExec {
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let batches = self.batches.as_ref().clone();
-        Ok(Box::pin(MemoryStream::try_new(batches, self.schema.clone(), None)?))
+        Ok(Box::pin(MemoryStream::try_new(
+            batches,
+            self.schema.clone(),
+            None,
+        )?))
     }
 }

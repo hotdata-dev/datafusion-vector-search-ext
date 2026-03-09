@@ -114,11 +114,17 @@ fn udtf_schema() -> SchemaRef {
 
 #[async_trait]
 impl TableProvider for USearchProvider {
-    fn as_any(&self) -> &dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 
-    fn schema(&self) -> SchemaRef { udtf_schema() }
+    fn schema(&self) -> SchemaRef {
+        udtf_schema()
+    }
 
-    fn table_type(&self) -> TableType { TableType::Base }
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
 
     async fn scan(
         &self,
@@ -137,11 +143,8 @@ impl TableProvider for USearchProvider {
         let keys = UInt64Array::from(matches.keys.clone());
         let dists = Float32Array::from(matches.distances.clone());
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(keys), Arc::new(dists)],
-        )
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(keys), Arc::new(dists)])
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
         // Apply column projection so DataFusion's JOIN column indices are correct.
         let (proj_schema, proj_batches) = if let Some(indices) = projection {
@@ -226,9 +229,7 @@ fn extract_f32_vec(expr: &Expr) -> Result<Vec<f32>> {
                 "List scalar inner is not Float32/Float64".into(),
             ))
         }
-        Expr::ScalarFunction(sf)
-            if sf.func.name() == "make_array" || sf.func.name() == "array" =>
-        {
+        Expr::ScalarFunction(sf) if sf.func.name() == "make_array" || sf.func.name() == "array" => {
             let mut result = Vec::with_capacity(sf.args.len());
             for arg in &sf.args {
                 match arg {
@@ -239,7 +240,7 @@ fn extract_f32_vec(expr: &Expr) -> Result<Vec<f32>> {
                     other => {
                         return Err(DataFusionError::Execution(format!(
                             "Non-literal in ARRAY[...]: {other:?}"
-                        )))
+                        )));
                     }
                 }
             }

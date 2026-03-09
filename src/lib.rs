@@ -93,7 +93,10 @@ pub fn register_all(ctx: &SessionContext, registry: Arc<USearchRegistry>) -> Res
     ctx.register_udf(ScalarUDF::new_from_impl(l2_distance_udf()));
     ctx.register_udf(ScalarUDF::new_from_impl(cosine_distance_udf()));
     ctx.register_udf(ScalarUDF::new_from_impl(negative_dot_product_udf()));
-    ctx.register_udtf("vector_usearch", Arc::new(USearchUDTF::new(registry.clone())));
+    ctx.register_udtf(
+        "vector_usearch",
+        Arc::new(USearchUDTF::new(registry.clone())),
+    );
     ctx.add_optimizer_rule(Arc::new(USearchRule::new(registry)));
     Ok(())
 }
