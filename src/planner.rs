@@ -31,7 +31,7 @@ use std::sync::Arc;
 use arrow_array::{Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, ListArray, LargeListArray, RecordBatch};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::common::{DFSchema, Result};
+use datafusion::common::Result;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
@@ -170,16 +170,16 @@ async fn adaptive_filtered_exec(
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let provider_schema = registered.provider.schema();
 
-    // Build a DFSchema from the provider's Arrow schema so we can compile
-    // logical filter Exprs into executable PhysicalExprs.
-    let df_schema = Arc::new(
-        DFSchema::try_from((*provider_schema).clone())
-            .map_err(|e| DataFusionError::Execution(format!("DFSchema build failed: {e}")))?
-    );
-
+    // Use the node's DFSchema (which carries the original table qualifier) to
+    // compile filter Exprs into PhysicalExprs.  Building a bare DFSchema from
+    // provider_schema would lose the catalog/schema qualification and cause
+    // `create_physical_expr` to fail for fully-qualified column references like
+    // `ed.public.hf_model_embeddings.library_name`.  The node schema has the
+    // same field ordering as the provider batches (data columns first, then
+    // _distance at the end), so column indices resolve correctly at eval time.
     let exec_props = session_state.execution_props();
     let physical_filters: Vec<Arc<dyn PhysicalExpr>> = node.filters.iter()
-        .map(|f| create_physical_expr(f, &df_schema, exec_props))
+        .map(|f| create_physical_expr(f, &node.schema, exec_props))
         .collect::<Result<_>>()?;
 
     // Column indices we need from the provider schema.
