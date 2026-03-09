@@ -1396,6 +1396,7 @@ dependencies = [
  "async-trait",
  "datafusion",
  "tokio",
+ "tracing",
  "usearch",
 ]
 

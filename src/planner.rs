@@ -47,6 +47,8 @@ use datafusion::execution::context::QueryPlanner;
 
 use usearch::ScalarKind;
 
+use tracing::Instrument;
+
 use crate::lookup::extract_keys_as_u64;
 use crate::node::{DistanceType, USearchNode};
 use crate::registry::USearchRegistry;
@@ -162,6 +164,20 @@ impl ExtensionPlanner for USearchExecPlanner {
 
 // ── Adaptive filtered execution ───────────────────────────────────────────────
 
+#[tracing::instrument(
+    name = "usearch_adaptive_filter",
+    skip_all,
+    fields(
+        usearch.table = %node.table_name,
+        usearch.k = node.k,
+        usearch.filter_count = node.filters.len(),
+        usearch.valid_rows = tracing::field::Empty,
+        usearch.total_rows = tracing::field::Empty,
+        usearch.selectivity = tracing::field::Empty,
+        usearch.path = tracing::field::Empty,
+        usearch.result_count = tracing::field::Empty,
+    )
+)]
 async fn adaptive_filtered_exec(
     node: &USearchNode,
     registered: &crate::registry::RegisteredTable,
@@ -192,7 +208,9 @@ async fn adaptive_filtered_exec(
         .scan(session_state, None, &[], None)
         .await?;
     let task_ctx = session_state.task_ctx();
-    let all_batches = collect(scan_plan, task_ctx).await?;
+    let all_batches = collect(scan_plan, task_ctx)
+        .instrument(tracing::info_span!("usearch_provider_scan", usearch.table = %node.table_name))
+        .await?;
 
     // Evaluate filters and collect valid rows.
     let mut valid_keys: HashSet<u64> = HashSet::new();
@@ -224,6 +242,9 @@ async fn adaptive_filtered_exec(
 
     // No rows pass the filter — return empty.
     if valid_keys.is_empty() {
+        tracing::debug!(table = %node.table_name, "usearch adaptive filter: 0 rows passed predicate, returning empty");
+        tracing::Span::current().record("usearch.valid_rows", 0usize);
+        tracing::Span::current().record("usearch.result_count", 0usize);
         return Ok(Some(Arc::new(USearchExec::new(
             node.table_name.clone(),
             registered.schema.clone(),
@@ -234,6 +255,27 @@ async fn adaptive_filtered_exec(
     let total = registered.index.size();
     let selectivity = valid_keys.len() as f64 / total.max(1) as f64;
     let threshold = registered.config.brute_force_selectivity_threshold;
+
+    let path = if selectivity <= threshold && has_vec_col && !key_distances.is_empty() {
+        "brute-force"
+    } else {
+        "filtered_search"
+    };
+    tracing::Span::current().record("usearch.valid_rows", valid_keys.len());
+    tracing::Span::current().record("usearch.total_rows", total);
+    tracing::Span::current().record("usearch.selectivity", selectivity);
+    tracing::Span::current().record("usearch.path", path);
+    tracing::debug!(
+        table = %node.table_name,
+        k = node.k,
+        valid_rows = valid_keys.len(),
+        total_rows = total,
+        selectivity = format!("{:.4}", selectivity),
+        threshold = threshold,
+        has_vec_col = has_vec_col,
+        "usearch adaptive filter: {} path (selectivity={:.4}, threshold={})",
+        path, selectivity, threshold,
+    );
 
     if selectivity <= threshold && has_vec_col && !key_distances.is_empty() {
         // ── Brute-force path: exact distances over the valid subset ───────
@@ -252,6 +294,7 @@ async fn adaptive_filtered_exec(
         let result_batches =
             attach_distances(data_batches, key_col_idx, &key_to_dist, &registered.schema)?;
 
+        tracing::Span::current().record("usearch.result_count", result_batches.iter().map(|b| b.num_rows()).sum::<usize>());
         Ok(Some(Arc::new(USearchExec::new(
             node.table_name.clone(),
             registered.schema.clone(),
@@ -264,12 +307,14 @@ async fn adaptive_filtered_exec(
         // don't satisfy the WHERE clause.  The graph keeps exploring until k
         // passing candidates are found — always returning exactly k results
         // (or fewer if the valid set has < k members).
-        let matches = usearch_filtered_search(
-            &registered.index, query, node.k, registered.scalar_kind,
-            |key| valid_keys.contains(&key),
-        )?;
+        let matches = tracing::info_span!("usearch_hnsw_filtered_search", usearch.table = %node.table_name)
+            .in_scope(|| usearch_filtered_search(
+                &registered.index, query, node.k, registered.scalar_kind,
+                |key| valid_keys.contains(&key),
+            ))?;
 
         if matches.keys.is_empty() {
+            tracing::Span::current().record("usearch.result_count", 0usize);
             return Ok(Some(Arc::new(USearchExec::new(
                 node.table_name.clone(),
                 registered.schema.clone(),
@@ -290,6 +335,7 @@ async fn adaptive_filtered_exec(
         let result_batches =
             attach_distances(data_batches, key_col_idx, &key_to_dist, &registered.schema)?;
 
+        tracing::Span::current().record("usearch.result_count", result_batches.iter().map(|b| b.num_rows()).sum::<usize>());
         Ok(Some(Arc::new(USearchExec::new(
             node.table_name.clone(),
             registered.schema.clone(),
