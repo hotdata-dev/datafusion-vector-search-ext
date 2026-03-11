@@ -1395,6 +1395,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "datafusion",
+ "futures",
  "tokio",
  "tracing",
  "usearch",

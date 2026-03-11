@@ -23,10 +23,16 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, TableType};
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::memory::MemoryStream;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+};
 use datafusion::scalar::ScalarValue;
 
-use crate::planner::USearchExec;
 use crate::registry::USearchRegistry;
 
 // ── UDTF ─────────────────────────────────────────────────────────────────────
@@ -161,11 +167,62 @@ impl TableProvider for USearchProvider {
             (schema, vec![batch])
         };
 
-        Ok(Arc::new(USearchExec::new(
-            self.table_name.clone(),
-            proj_schema,
-            proj_batches,
-        )))
+        Ok(Arc::new(BatchExec::new(proj_schema, proj_batches)))
+    }
+}
+
+// ── Simple pre-computed batch execution plan ──────────────────────────────────
+
+#[derive(Debug)]
+struct BatchExec {
+    schema: SchemaRef,
+    batches: Arc<Vec<RecordBatch>>,
+    properties: PlanProperties,
+}
+
+impl BatchExec {
+    fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self { schema, batches: Arc::new(batches), properties }
+    }
+}
+
+impl DisplayAs for BatchExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "BatchExec: {} batches", self.batches.len())
+    }
+}
+
+impl ExecutionPlan for BatchExec {
+    fn name(&self) -> &str { "BatchExec" }
+    fn as_any(&self) -> &dyn Any { self }
+    fn properties(&self) -> &PlanProperties { &self.properties }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            Err(DataFusionError::Internal(
+                "BatchExec is a leaf node".to_string(),
+            ))
+        }
+    }
+
+    fn execute(&self, _partition: usize, _context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+        Ok(Box::pin(MemoryStream::try_new(
+            self.batches.as_ref().clone(),
+            self.schema.clone(),
+            None,
+        )?))
     }
 }
 
