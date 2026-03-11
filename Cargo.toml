@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 tracing     = "0.1"
-datafusion  = "51.0.0"
+datafusion  = "52.2.0"
 usearch     = "2.24.0"
 arrow-array = "57.2.0"
 arrow-schema = "57.2.0"
