@@ -188,7 +188,11 @@ impl BatchExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
-        Self { schema, batches: Arc::new(batches), properties }
+        Self {
+            schema,
+            batches: Arc::new(batches),
+            properties,
+        }
     }
 }
 
@@ -199,10 +203,18 @@ impl DisplayAs for BatchExec {
 }
 
 impl ExecutionPlan for BatchExec {
-    fn name(&self) -> &str { "BatchExec" }
-    fn as_any(&self) -> &dyn Any { self }
-    fn properties(&self) -> &PlanProperties { &self.properties }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
+    fn name(&self) -> &str {
+        "BatchExec"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
 
     fn with_new_children(
         self: Arc<Self>,
@@ -217,7 +229,11 @@ impl ExecutionPlan for BatchExec {
         }
     }
 
-    fn execute(&self, _partition: usize, _context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
         Ok(Box::pin(MemoryStream::try_new(
             self.batches.as_ref().clone(),
             self.schema.clone(),
