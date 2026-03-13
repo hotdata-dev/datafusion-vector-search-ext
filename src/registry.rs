@@ -193,6 +193,13 @@ pub struct USearchRegistry {
     tables: RwLock<HashMap<String, Arc<RegisteredTable>>>,
 }
 
+impl std::fmt::Debug for USearchRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tables = self.tables.read().unwrap();
+        write!(f, "USearchRegistry({} tables)", tables.len())
+    }
+}
+
 impl USearchRegistry {
     pub fn new() -> Self {
         Self {
