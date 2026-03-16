@@ -56,6 +56,7 @@
 //! LIMIT 10
 //! ```
 
+pub mod keys;
 pub mod lookup;
 pub mod node;
 pub mod planner;
@@ -64,6 +65,12 @@ pub mod rule;
 pub mod udf;
 pub mod udtf;
 
+#[cfg(feature = "parquet-provider")]
+pub mod parquet_provider;
+#[cfg(feature = "sqlite-provider")]
+pub mod sqlite_provider;
+
+pub use keys::{DatasetLayout, pack_key, unpack_key};
 pub use lookup::{HashKeyProvider, PointLookupProvider};
 pub use node::{DistanceType, USearchNode};
 pub use planner::{USearchExec, USearchExecPlanner, USearchQueryPlanner};
@@ -71,6 +78,11 @@ pub use registry::{RegisteredTable, USearchIndexConfig, USearchRegistry, USearch
 pub use rule::USearchRule;
 pub use udf::{cosine_distance_udf, l2_distance_udf, negative_dot_product_udf};
 pub use udtf::USearchUDTF;
+
+#[cfg(feature = "parquet-provider")]
+pub use parquet_provider::ParquetLookupProvider;
+#[cfg(feature = "sqlite-provider")]
+pub use sqlite_provider::SqliteLookupProvider;
 
 use std::sync::Arc;
 
