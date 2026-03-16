@@ -78,6 +78,13 @@ impl Drop for ConnGuard {
     }
 }
 
+/// Double-quote a SQLite identifier, escaping embedded double-quotes by
+/// doubling them.  This prevents SQL injection when a caller-supplied name
+/// is interpolated into a statement as an identifier.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 fn open_conn(db_path: &str) -> DFResult<Connection> {
     let conn = Connection::open(db_path).map_err(|e| DataFusionError::Execution(e.to_string()))?;
     conn.execute_batch(
@@ -106,6 +113,11 @@ impl SqliteLookupProvider {
         schema: SchemaRef,
         parquet_col_indices: &[usize],
     ) -> DFResult<Self> {
+        if pool_size == 0 {
+            return Err(DataFusionError::Execution(
+                "pool_size must be at least 1".into(),
+            ));
+        }
         let conn = open_conn(db_path)?;
 
         let table_exists: bool = conn
@@ -120,7 +132,7 @@ impl SqliteLookupProvider {
         if table_exists {
             let n: i64 = conn
                 .query_row(
-                    &format!("SELECT COUNT(*) FROM \"{table_name}\""),
+                    &format!("SELECT COUNT(*) FROM {}", quote_ident(table_name)),
                     [],
                     |row| row.get(0),
                 )
@@ -194,7 +206,15 @@ impl PointLookupProvider for SqliteLookupProvider {
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
         let result = tokio::task::spawn_blocking(move || {
-            let conn = pool.lock().unwrap().pop().unwrap();
+            let conn = pool
+                .lock()
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("connection pool mutex poisoned: {e}"))
+                })?
+                .pop()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("connection pool unexpectedly empty".into())
+                })?;
             let guard = ConnGuard::new(pool, conn);
             let res = execute_query_sync(
                 guard.conn.as_ref().unwrap(),
@@ -222,7 +242,8 @@ fn execute_query_sync(
 ) -> DFResult<Vec<RecordBatch>> {
     let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
     let sql = format!(
-        "SELECT * FROM \"{table_name}\" WHERE row_idx IN ({placeholders}) ORDER BY row_idx"
+        "SELECT * FROM {tn} WHERE row_idx IN ({placeholders}) ORDER BY row_idx",
+        tn = quote_ident(table_name)
     );
 
     let n_out = out_schema.fields().len();
@@ -316,8 +337,11 @@ fn build_table(
         .collect::<Vec<_>>()
         .join(", ");
 
-    conn.execute_batch(&format!("CREATE TABLE \"{table_name}\" ({col_defs});"))
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    conn.execute_batch(&format!(
+        "CREATE TABLE {} ({col_defs});",
+        quote_ident(table_name)
+    ))
+    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
     let placeholders = schema
         .fields()
@@ -325,7 +349,10 @@ fn build_table(
         .map(|_| "?")
         .collect::<Vec<_>>()
         .join(", ");
-    let insert_sql = format!("INSERT INTO \"{table_name}\" VALUES ({placeholders})");
+    let insert_sql = format!(
+        "INSERT INTO {} VALUES ({placeholders})",
+        quote_ident(table_name)
+    );
 
     let tx = conn
         .unchecked_transaction()

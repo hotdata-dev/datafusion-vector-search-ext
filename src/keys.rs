@@ -7,8 +7,21 @@
 
 /// Pack a physical row address into a single `u64` key for use with USearch
 /// and the lookup providers.
+///
+/// # Panics (debug builds only)
+/// Asserts that each component fits within its allocated bit range:
+/// `file_idx` < 65 536, `rg_idx` < 65 536, `local_offset` < 4 294 967 296.
 #[inline]
 pub fn pack_key(file_idx: usize, rg_idx: usize, local_offset: usize) -> u64 {
+    debug_assert!(
+        file_idx < (1 << 16),
+        "file_idx {file_idx} overflows 16 bits"
+    );
+    debug_assert!(rg_idx < (1 << 16), "rg_idx {rg_idx} overflows 16 bits");
+    debug_assert!(
+        local_offset < (1 << 32),
+        "local_offset {local_offset} overflows 32 bits"
+    );
     ((file_idx as u64) << 48) | ((rg_idx as u64) << 32) | (local_offset as u64)
 }
 
