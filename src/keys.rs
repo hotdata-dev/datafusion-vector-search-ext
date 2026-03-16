@@ -8,17 +8,17 @@
 /// Pack a physical row address into a single `u64` key for use with USearch
 /// and the lookup providers.
 ///
-/// # Panics (debug builds only)
-/// Asserts that each component fits within its allocated bit range:
-/// `file_idx` < 65 536, `rg_idx` < 65 536, `local_offset` < 4 294 967 296.
+/// # Panics
+/// Panics if any component exceeds its allocated bit range:
+/// `file_idx` < 65 536, `rg_idx` < 65 536, `local_offset` ≤ 4 294 967 295.
 #[inline]
 pub fn pack_key(file_idx: usize, rg_idx: usize, local_offset: usize) -> u64 {
-    debug_assert!(
+    assert!(
         file_idx < (1 << 16),
         "file_idx {file_idx} overflows 16 bits"
     );
-    debug_assert!(rg_idx < (1 << 16), "rg_idx {rg_idx} overflows 16 bits");
-    debug_assert!(
+    assert!(rg_idx < (1 << 16), "rg_idx {rg_idx} overflows 16 bits");
+    assert!(
         local_offset <= u32::MAX as usize,
         "local_offset {local_offset} overflows 32 bits"
     );
@@ -133,19 +133,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "overflows 32 bits")]
-    fn test_pack_key_local_offset_overflow_panics_in_debug() {
-        // This is the bug fixed by using u32::MAX as usize instead of (1 << 32):
-        // on 64-bit platforms the old expression compiled but the assertion was
-        // wrong; on 32-bit platforms it would have panicked unconditionally.
+    fn test_pack_key_local_offset_overflow_panics() {
         pack_key(0, 0, u32::MAX as usize + 1);
     }
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "overflows 16 bits")]
-    fn test_pack_key_file_idx_overflow_panics_in_debug() {
+    fn test_pack_key_file_idx_overflow_panics() {
         pack_key(1 << 16, 0, 0);
     }
 }
