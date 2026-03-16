@@ -60,9 +60,27 @@ impl DatasetLayout {
 
     /// Scan parquet footers to build the layout. No vector data is read.
     ///
+    /// `key_prefix` is prepended to each bare filename when storing the
+    /// object-store path in `file_keys`. It must match the prefix used when
+    /// constructing the `ObjectStore` passed to `ParquetLookupProvider`, so
+    /// that `store.get("{key_prefix}{filename}")` resolves to the correct
+    /// object at query time.
+    ///
+    /// # Examples
+    /// ```text
+    /// // Files at /data/shard_00.parquet, store rooted at /data
+    /// DatasetLayout::from_files(&["/data/shard_00.parquet"], "")
+    ///
+    /// // Files under a parquet/ subdirectory, store rooted at /data
+    /// DatasetLayout::from_files(&["/data/parquet/shard_00.parquet"], "parquet/")
+    ///
+    /// // Local footer reads, but keys point at S3 prefix
+    /// DatasetLayout::from_files(&["/local/cache/shard_00.parquet"], "year=2024/")
+    /// ```
+    ///
     /// Only compiled when the `parquet-provider` or `sqlite-provider` feature is enabled.
     #[cfg(any(feature = "parquet-provider", feature = "sqlite-provider"))]
-    pub fn from_files(local_paths: &[&str]) -> datafusion::common::Result<Self> {
+    pub fn from_files(local_paths: &[&str], key_prefix: &str) -> datafusion::common::Result<Self> {
         use datafusion::error::DataFusionError;
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         use std::fs;
@@ -78,7 +96,7 @@ impl DatasetLayout {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| DataFusionError::Execution(format!("invalid path: {path}")))?;
-            file_keys.push(format!("parquet/{file_name}"));
+            file_keys.push(format!("{key_prefix}{file_name}"));
 
             let f = fs::File::open(path)
                 .map_err(|e| DataFusionError::Execution(format!("open {path}: {e}")))?;
