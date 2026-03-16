@@ -312,6 +312,23 @@ impl PointLookupProvider for ParquetLookupProvider {
                         (cols, gkeys)
                     };
 
+                    // `filtered` is in parquet schema order (ascending column index),
+                    // but `selected_parquet_cols` is in `idxs` order. Reorder so that
+                    // filtered[i] corresponds to selected_parquet_cols[i].
+                    let filtered = {
+                        let mut order: Vec<(usize, usize)> = selected_parquet_cols
+                            .iter()
+                            .enumerate()
+                            .map(|(pos, &pc)| (pc, pos))
+                            .collect();
+                        order.sort_by_key(|&(pc, _)| pc);
+                        let mut reordered = vec![None::<Arc<dyn Array>>; filtered.len()];
+                        for (j, (_, out_pos)) in order.into_iter().enumerate() {
+                            reordered[out_pos] = Some(filtered[j].clone());
+                        }
+                        reordered.into_iter().map(|c| c.unwrap()).collect::<Vec<_>>()
+                    };
+
                     let row_idx_arr: Arc<dyn Array> = Arc::new(UInt64Array::from(global_keys));
 
                     let out_cols: Vec<Arc<dyn Array>> = match projection_owned.as_deref() {

@@ -19,7 +19,7 @@ pub fn pack_key(file_idx: usize, rg_idx: usize, local_offset: usize) -> u64 {
     );
     debug_assert!(rg_idx < (1 << 16), "rg_idx {rg_idx} overflows 16 bits");
     debug_assert!(
-        local_offset < (1 << 32),
+        local_offset <= u32::MAX as usize,
         "local_offset {local_offset} overflows 32 bits"
     );
     ((file_idx as u64) << 48) | ((rg_idx as u64) << 32) | (local_offset as u64)

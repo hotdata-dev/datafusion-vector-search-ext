@@ -452,6 +452,9 @@ fn arrow_cell_to_sql(col: &ArrayRef, row: usize) -> SqlValue {
                 .unwrap()
                 .value(row) as i64,
         ),
+        // UInt64 values > i64::MAX (2^63-1) will wrap to negative when cast to
+        // SQLite INTEGER. This is acceptable for packed usearch keys (which use
+        // only 63 bits) but callers storing arbitrary u64 data should be aware.
         DataType::UInt64 => SqlValue::Integer(
             col.as_any()
                 .downcast_ref::<UInt64Array>()
