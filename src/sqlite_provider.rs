@@ -1,0 +1,605 @@
+// sqlite_provider.rs — SQLite-backed PointLookupProvider.
+//
+// Stores all non-embedding columns in a local SQLite database (bundled libsqlite3).
+// Scalar columns map to INTEGER/TEXT/REAL; list columns are serialised as JSON TEXT.
+// Lookups use `WHERE row_idx IN (?, ...)` against the INTEGER PRIMARY KEY B-tree.
+//
+// Schema: row_idx INTEGER PRIMARY KEY, <col> TEXT/INTEGER/REAL, ...
+//
+// Persistence: the database is written once to the given path and reused on
+// subsequent runs. The first build reads all parquet files and inserts rows
+// inside a single transaction.
+
+use std::any::Any;
+use std::fmt;
+use std::sync::{Arc, Mutex};
+
+use arrow_array::builder::{Int32Builder, Int64Builder, ListBuilder, StringBuilder};
+use arrow_array::{
+    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    UInt32Array, UInt64Array,
+};
+use arrow_schema::{DataType, SchemaRef};
+use async_trait::async_trait;
+use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::Result as DFResult;
+use datafusion::datasource::MemTable;
+use datafusion::error::DataFusionError;
+use datafusion::logical_expr::{Expr, TableType};
+use datafusion::physical_plan::ExecutionPlan;
+use rusqlite::{Connection, types::Value as SqlValue};
+use tokio::sync::Semaphore;
+
+use crate::keys::{DatasetLayout, pack_key};
+use crate::lookup::PointLookupProvider;
+
+// ── Provider ──────────────────────────────────────────────────────────────────
+
+pub struct SqliteLookupProvider {
+    schema: SchemaRef,
+    table_name: String,
+    pool: Arc<Mutex<Vec<Connection>>>,
+    sem: Arc<Semaphore>,
+}
+
+impl fmt::Debug for SqliteLookupProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SqliteLookupProvider(table={}, schema_cols={})",
+            self.table_name,
+            self.schema.fields().len()
+        )
+    }
+}
+
+fn open_conn(db_path: &str) -> DFResult<Connection> {
+    let conn = Connection::open(db_path).map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous  = NORMAL;
+         PRAGMA cache_size   = -65536;",
+    )
+    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    Ok(conn)
+}
+
+impl SqliteLookupProvider {
+    /// Open the existing SQLite database at `db_path`, or build it from
+    /// parquet files on first run.  Opens a pool of `pool_size` read
+    /// connections (WAL allows N concurrent readers).
+    ///
+    /// `local_parquet_files`, `layout`, `schema`, and `parquet_col_indices`
+    /// are only used if the table does not yet exist.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_build(
+        db_path: &str,
+        table_name: &str,
+        pool_size: usize,
+        local_parquet_files: &[String],
+        layout: &DatasetLayout,
+        schema: SchemaRef,
+        parquet_col_indices: &[usize],
+    ) -> DFResult<Self> {
+        let conn = open_conn(db_path)?;
+
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                rusqlite::params![table_name],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?
+            > 0;
+
+        if table_exists {
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM \"{table_name}\""),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            println!("  SQLite table '{table_name}' already exists ({n} rows), skipping build.");
+        } else {
+            println!("  First run: building SQLite table '{table_name}' (one-time)…");
+            build_table(
+                &conn,
+                table_name,
+                local_parquet_files,
+                layout,
+                &schema,
+                parquet_col_indices,
+            )?;
+        }
+
+        let mut conns = vec![conn];
+        for _ in 1..pool_size {
+            conns.push(open_conn(db_path)?);
+        }
+        Ok(Self {
+            schema,
+            table_name: table_name.to_string(),
+            pool: Arc::new(Mutex::new(conns)),
+            sem: Arc::new(Semaphore::new(pool_size)),
+        })
+    }
+}
+
+// ── PointLookupProvider ───────────────────────────────────────────────────────
+
+#[async_trait]
+impl PointLookupProvider for SqliteLookupProvider {
+    async fn fetch_by_keys(
+        &self,
+        keys: &[u64],
+        _key_col: &str,
+        projection: Option<&[usize]>,
+    ) -> DFResult<Vec<RecordBatch>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let out_schema = match projection {
+            None => self.schema.clone(),
+            Some(idxs) => Arc::new(arrow_schema::Schema::new(
+                idxs.iter()
+                    .map(|&i| self.schema.field(i).clone())
+                    .collect::<Vec<_>>(),
+            )),
+        };
+        let proj_owned: Option<Vec<usize>> = projection.map(|s| s.to_vec());
+        let keys_vec = keys.to_vec();
+        let pool = self.pool.clone();
+        let table_name = self.table_name.clone();
+
+        // Acquire a semaphore permit to bound concurrency to the pool size,
+        // then run the synchronous SQLite query on a blocking thread.
+        let _permit = self
+            .sem
+            .acquire()
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = pool.lock().unwrap().pop().unwrap();
+            let res = execute_query_sync(
+                &conn,
+                &keys_vec,
+                &out_schema,
+                proj_owned.as_deref(),
+                &table_name,
+            );
+            pool.lock().unwrap().push(conn);
+            res
+        })
+        .await
+        .map_err(|e| DataFusionError::Execution(e.to_string()))??;
+
+        Ok(result)
+    }
+}
+
+fn execute_query_sync(
+    conn: &Connection,
+    keys: &[u64],
+    out_schema: &SchemaRef,
+    projection: Option<&[usize]>,
+    table_name: &str,
+) -> DFResult<Vec<RecordBatch>> {
+    let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT * FROM \"{table_name}\" WHERE row_idx IN ({placeholders}) ORDER BY row_idx"
+    );
+
+    let n_out = out_schema.fields().len();
+    let mut col_bufs: Vec<Vec<SqlValue>> = vec![Vec::with_capacity(keys.len()); n_out];
+
+    let key_params: Vec<SqlValue> = keys.iter().map(|&k| SqlValue::Integer(k as i64)).collect();
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(key_params.iter()))
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?
+    {
+        for (out_idx, field_idx) in projected_indices(projection, n_out).enumerate() {
+            let v: SqlValue = row
+                .get(field_idx)
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            col_bufs[out_idx].push(v);
+        }
+    }
+
+    if col_bufs[0].is_empty() {
+        return Ok(vec![]);
+    }
+
+    let arrays: Vec<ArrayRef> = out_schema
+        .fields()
+        .iter()
+        .zip(col_bufs)
+        .map(|(field, values)| sql_values_to_arrow(field.data_type(), values))
+        .collect::<DFResult<_>>()?;
+
+    let batch = RecordBatch::try_new(out_schema.clone(), arrays)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    Ok(vec![batch])
+}
+
+// ── TableProvider ─────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl TableProvider for SqliteLookupProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        MemTable::try_new(self.schema.clone(), vec![])?
+            .scan(state, projection, &[], None)
+            .await
+    }
+}
+
+// ── Build helpers ─────────────────────────────────────────────────────────────
+
+fn build_table(
+    conn: &Connection,
+    table_name: &str,
+    parquet_files: &[String],
+    layout: &DatasetLayout,
+    schema: &SchemaRef,
+    parquet_col_indices: &[usize],
+) -> DFResult<()> {
+    let col_defs = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let sql_type = arrow_type_to_sql(f.data_type());
+            if f.name() == "row_idx" {
+                "row_idx INTEGER PRIMARY KEY".to_string()
+            } else {
+                format!("\"{}\" {}", f.name(), sql_type)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    conn.execute_batch(&format!("CREATE TABLE \"{table_name}\" ({col_defs});"))
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+    let placeholders = schema
+        .fields()
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_sql = format!("INSERT INTO \"{table_name}\" VALUES ({placeholders})");
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    {
+        let mut stmt = tx
+            .prepare(&insert_sql)
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+        for (file_idx, file_path) in parquet_files.iter().enumerate() {
+            let f = std::fs::File::open(file_path)
+                .map_err(|e| DataFusionError::Execution(format!("open {file_path}: {e}")))?;
+            let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            let reader = builder
+                .with_batch_size(2048)
+                .build()
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            let mut file_row: u64 = 0;
+
+            for batch_result in reader {
+                let batch = batch_result.map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                let n = batch.num_rows();
+
+                for row_i in 0..n {
+                    let r = file_row + row_i as u64;
+                    let rg = layout.rg_cum_rows[file_idx].partition_point(|&s| s <= r) - 1;
+                    let lo = (r - layout.rg_cum_rows[file_idx][rg]) as usize;
+                    let packed_key = pack_key(file_idx, rg, lo);
+
+                    let mut params: Vec<SqlValue> = Vec::with_capacity(schema.fields().len());
+                    params.push(SqlValue::Integer(packed_key as i64));
+
+                    for &ci in parquet_col_indices {
+                        params.push(arrow_cell_to_sql(batch.column(ci), row_i));
+                    }
+
+                    stmt.execute(rusqlite::params_from_iter(params.iter()))
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                }
+                file_row += n as u64;
+            }
+        }
+    }
+    tx.commit()
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    println!("  SQLite table '{table_name}' built and committed.");
+    Ok(())
+}
+
+// ── Type conversion helpers ───────────────────────────────────────────────────
+
+fn arrow_type_to_sql(dt: &DataType) -> &'static str {
+    match dt {
+        DataType::UInt64 | DataType::UInt32 | DataType::Int32 | DataType::Int64 => "INTEGER",
+        DataType::Float32 | DataType::Float64 => "REAL",
+        _ => "TEXT", // Utf8, LargeUtf8, List variants → TEXT (JSON for lists)
+    }
+}
+
+fn arrow_cell_to_sql(col: &ArrayRef, row: usize) -> SqlValue {
+    if col.is_null(row) {
+        return SqlValue::Null;
+    }
+    match col.data_type() {
+        DataType::Utf8 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row);
+            SqlValue::Text(v.to_string())
+        }
+        DataType::LargeUtf8 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<arrow_array::LargeStringArray>()
+                .unwrap()
+                .value(row);
+            SqlValue::Text(v.to_string())
+        }
+        DataType::Int32 => SqlValue::Integer(
+            col.as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        DataType::Int64 => SqlValue::Integer(
+            col.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::UInt32 => SqlValue::Integer(
+            col.as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        DataType::UInt64 => SqlValue::Integer(
+            col.as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        DataType::Float32 => SqlValue::Real(
+            col.as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row) as f64,
+        ),
+        DataType::Float64 => SqlValue::Real(
+            col.as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::List(_) | DataType::LargeList(_) => SqlValue::Text(serialize_list(col, row)),
+        _ => SqlValue::Null,
+    }
+}
+
+fn serialize_list(col: &ArrayRef, row: usize) -> String {
+    use serde_json::Value as JV;
+
+    let list_val: ArrayRef =
+        if let Some(arr) = col.as_any().downcast_ref::<arrow_array::ListArray>() {
+            arr.value(row)
+        } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeListArray>() {
+            arr.value(row)
+        } else {
+            return "[]".to_string();
+        };
+
+    let items: Vec<JV> = (0..list_val.len())
+        .map(|i| {
+            if list_val.is_null(i) {
+                return JV::Null;
+            }
+            match list_val.data_type() {
+                DataType::Utf8 => {
+                    let s = list_val
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(i);
+                    JV::String(s.to_string())
+                }
+                DataType::LargeUtf8 => {
+                    let s = list_val
+                        .as_any()
+                        .downcast_ref::<arrow_array::LargeStringArray>()
+                        .unwrap()
+                        .value(i);
+                    JV::String(s.to_string())
+                }
+                DataType::Int64 => {
+                    let v = list_val
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(i);
+                    JV::Number(v.into())
+                }
+                DataType::Int32 => {
+                    let v = list_val
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(i);
+                    JV::Number(v.into())
+                }
+                _ => JV::Null,
+            }
+        })
+        .collect();
+
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn sql_values_to_arrow(dt: &DataType, values: Vec<SqlValue>) -> DFResult<ArrayRef> {
+    Ok(match dt {
+        DataType::UInt64 => {
+            let arr: UInt64Array = values
+                .iter()
+                .map(|v| match v {
+                    SqlValue::Integer(i) => Some(*i as u64),
+                    _ => None,
+                })
+                .collect();
+            Arc::new(arr)
+        }
+        DataType::UInt32 => {
+            let arr: UInt32Array = values
+                .iter()
+                .map(|v| match v {
+                    SqlValue::Integer(i) => Some(*i as u32),
+                    _ => None,
+                })
+                .collect();
+            Arc::new(arr)
+        }
+        DataType::Int32 => {
+            let mut b = Int32Builder::with_capacity(values.len());
+            for v in &values {
+                match v {
+                    SqlValue::Integer(i) => b.append_value(*i as i32),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Int64 => {
+            let mut b = Int64Builder::with_capacity(values.len());
+            for v in &values {
+                match v {
+                    SqlValue::Integer(i) => b.append_value(*i),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Utf8 => {
+            let mut b = StringBuilder::with_capacity(values.len(), values.len() * 32);
+            for v in &values {
+                match v {
+                    SqlValue::Text(s) => b.append_value(s),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::List(item_field) => match item_field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                let mut b =
+                    ListBuilder::new(StringBuilder::new()).with_field(item_field.as_ref().clone());
+                for v in &values {
+                    match v {
+                        SqlValue::Text(s) => {
+                            let items: Vec<Option<String>> =
+                                serde_json::from_str(s).unwrap_or_default();
+                            for item in items {
+                                b.values().append_option(item);
+                            }
+                            b.append(true);
+                        }
+                        _ => b.append(false),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Int64 => {
+                let mut b =
+                    ListBuilder::new(Int64Builder::new()).with_field(item_field.as_ref().clone());
+                for v in &values {
+                    match v {
+                        SqlValue::Text(s) => {
+                            let items: Vec<Option<i64>> =
+                                serde_json::from_str(s).unwrap_or_default();
+                            for item in items {
+                                b.values().append_option(item);
+                            }
+                            b.append(true);
+                        }
+                        _ => b.append(false),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            DataType::Int32 => {
+                let mut b =
+                    ListBuilder::new(Int32Builder::new()).with_field(item_field.as_ref().clone());
+                for v in &values {
+                    match v {
+                        SqlValue::Text(s) => {
+                            let items: Vec<Option<i32>> =
+                                serde_json::from_str(s).unwrap_or_default();
+                            for item in items {
+                                b.values().append_option(item);
+                            }
+                            b.append(true);
+                        }
+                        _ => b.append(false),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            inner => Err(DataFusionError::Execution(format!(
+                "SqliteLookupProvider: unsupported list item type {inner:?}"
+            )))?,
+        },
+        other => Err(DataFusionError::Execution(format!(
+            "SqliteLookupProvider: unsupported Arrow type {other:?}"
+        )))?,
+    })
+}
+
+/// Iterate the column indices to read from the SQLite row.
+/// When projection is None, yields 0..n_out in order.
+/// When projection is Some, maps each projected index to its full-schema position.
+fn projected_indices(
+    projection: Option<&[usize]>,
+    n_out: usize,
+) -> impl Iterator<Item = usize> + '_ {
+    let indices: Vec<usize> = match projection {
+        None => (0..n_out).collect(),
+        Some(idxs) => idxs.to_vec(),
+    };
+    indices.into_iter()
+}
