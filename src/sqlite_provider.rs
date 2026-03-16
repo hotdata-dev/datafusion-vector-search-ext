@@ -191,7 +191,6 @@ impl PointLookupProvider for SqliteLookupProvider {
                     .collect::<Vec<_>>(),
             )),
         };
-        let proj_owned: Option<Vec<usize>> = projection.map(|s| s.to_vec());
         let keys_vec = keys.to_vec();
         let pool = self.pool.clone();
         let table_name = self.table_name.clone();
@@ -219,7 +218,6 @@ impl PointLookupProvider for SqliteLookupProvider {
                 guard.conn.as_ref().unwrap(),
                 &keys_vec,
                 &out_schema,
-                proj_owned.as_deref(),
                 &table_name,
             );
             drop(guard); // explicit but not required — Drop handles it
@@ -236,12 +234,19 @@ fn execute_query_sync(
     conn: &Connection,
     keys: &[u64],
     out_schema: &SchemaRef,
-    projection: Option<&[usize]>,
     table_name: &str,
 ) -> DFResult<Vec<RecordBatch>> {
     let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    // Select only the columns in out_schema (already projection-applied by the
+    // caller) so we don't fetch unused columns from SQLite.
+    let col_list = out_schema
+        .fields()
+        .iter()
+        .map(|f| quote_ident(f.name()))
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
-        "SELECT * FROM {tn} WHERE row_idx IN ({placeholders}) ORDER BY row_idx",
+        "SELECT {col_list} FROM {tn} WHERE row_idx IN ({placeholders}) ORDER BY row_idx",
         tn = quote_ident(table_name)
     );
 
@@ -262,11 +267,11 @@ fn execute_query_sync(
         .next()
         .map_err(|e| DataFusionError::Execution(e.to_string()))?
     {
-        for (out_idx, field_idx) in projected_indices(projection, n_out).enumerate() {
+        for (out_idx, buf) in col_bufs.iter_mut().enumerate() {
             let v: SqlValue = row
-                .get(field_idx)
+                .get(out_idx)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            col_bufs[out_idx].push(v);
+            buf.push(v);
         }
     }
 
@@ -336,12 +341,6 @@ fn build_table(
         .collect::<Vec<_>>()
         .join(", ");
 
-    conn.execute_batch(&format!(
-        "CREATE TABLE {} ({col_defs});",
-        quote_ident(table_name)
-    ))
-    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-
     let placeholders = schema
         .fields()
         .iter()
@@ -353,10 +352,20 @@ fn build_table(
         quote_ident(table_name)
     );
 
+    // CREATE TABLE and all INSERTs share one transaction so a mid-build crash
+    // leaves no half-built table. If the table exists with zero rows on the
+    // next startup, open_or_build would wrongly skip the build; atomicity
+    // ensures the table either doesn't exist or is fully populated.
     let tx = conn
         .unchecked_transaction()
         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
     {
+        tx.execute_batch(&format!(
+            "CREATE TABLE {} ({col_defs});",
+            quote_ident(table_name)
+        ))
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
         let mut stmt = tx
             .prepare(&insert_sql)
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
@@ -646,22 +655,28 @@ fn sql_values_to_arrow(dt: &DataType, values: Vec<SqlValue>) -> DFResult<ArrayRe
                 "SqliteLookupProvider: unsupported list item type {inner:?}"
             )))?,
         },
+        DataType::Float64 => {
+            let arr: Float64Array = values
+                .iter()
+                .map(|v| match v {
+                    SqlValue::Real(f) => Some(*f),
+                    _ => None,
+                })
+                .collect();
+            Arc::new(arr)
+        }
+        DataType::Float32 => {
+            let arr: Float32Array = values
+                .iter()
+                .map(|v| match v {
+                    SqlValue::Real(f) => Some(*f as f32),
+                    _ => None,
+                })
+                .collect();
+            Arc::new(arr)
+        }
         other => Err(DataFusionError::Execution(format!(
             "SqliteLookupProvider: unsupported Arrow type {other:?}"
         )))?,
     })
-}
-
-/// Iterate the column indices to read from the SQLite row.
-/// When projection is None, yields 0..n_out in order.
-/// When projection is Some, maps each projected index to its full-schema position.
-fn projected_indices(
-    projection: Option<&[usize]>,
-    n_out: usize,
-) -> impl Iterator<Item = usize> + '_ {
-    let indices: Vec<usize> = match projection {
-        None => (0..n_out).collect(),
-        Some(idxs) => idxs.to_vec(),
-    };
-    indices.into_iter()
 }
