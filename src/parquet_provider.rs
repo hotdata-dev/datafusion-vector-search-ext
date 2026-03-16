@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
-use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
@@ -380,13 +379,13 @@ impl datafusion::catalog::TableProvider for ParquetLookupProvider {
     }
     async fn scan(
         &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        MemTable::try_new(self.schema.clone(), vec![])?
-            .scan(state, projection, &[], None)
-            .await
+        Err(DataFusionError::NotImplemented(
+            "ParquetLookupProvider does not support full table scans; use fetch_by_keys".into(),
+        ))
     }
 }

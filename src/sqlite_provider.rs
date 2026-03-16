@@ -23,7 +23,6 @@ use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result as DFResult;
-use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
@@ -302,14 +301,14 @@ impl TableProvider for SqliteLookupProvider {
     }
     async fn scan(
         &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        _state: &dyn Session,
+        _projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        MemTable::try_new(self.schema.clone(), vec![])?
-            .scan(state, projection, &[], None)
-            .await
+        Err(DataFusionError::NotImplemented(
+            "SqliteLookupProvider does not support full table scans; use fetch_by_keys".into(),
+        ))
     }
 }
 
