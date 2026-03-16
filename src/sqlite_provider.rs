@@ -53,6 +53,31 @@ impl fmt::Debug for SqliteLookupProvider {
     }
 }
 
+/// RAII guard that returns the connection to the pool on drop, even on panic.
+struct ConnGuard {
+    pool: Arc<Mutex<Vec<Connection>>>,
+    conn: Option<Connection>,
+}
+
+impl ConnGuard {
+    fn new(pool: Arc<Mutex<Vec<Connection>>>, conn: Connection) -> Self {
+        Self {
+            pool,
+            conn: Some(conn),
+        }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.conn.take() {
+            // best-effort: ignore poison so a panicking query doesn't
+            // permanently shrink the pool.
+            let _ = self.pool.lock().map(|mut p| p.push(c));
+        }
+    }
+}
+
 fn open_conn(db_path: &str) -> DFResult<Connection> {
     let conn = Connection::open(db_path).map_err(|e| DataFusionError::Execution(e.to_string()))?;
     conn.execute_batch(
@@ -100,9 +125,16 @@ impl SqliteLookupProvider {
                     |row| row.get(0),
                 )
                 .unwrap_or(0);
-            println!("  SQLite table '{table_name}' already exists ({n} rows), skipping build.");
+            tracing::info!(
+                "SQLite table '{}' already exists ({} rows), skipping build.",
+                table_name,
+                n
+            );
         } else {
-            println!("  First run: building SQLite table '{table_name}' (one-time)…");
+            tracing::info!(
+                "First run: building SQLite table '{}' (one-time).",
+                table_name
+            );
             build_table(
                 &conn,
                 table_name,
@@ -163,14 +195,15 @@ impl PointLookupProvider for SqliteLookupProvider {
 
         let result = tokio::task::spawn_blocking(move || {
             let conn = pool.lock().unwrap().pop().unwrap();
+            let guard = ConnGuard::new(pool, conn);
             let res = execute_query_sync(
-                &conn,
+                guard.conn.as_ref().unwrap(),
                 &keys_vec,
                 &out_schema,
                 proj_owned.as_deref(),
                 &table_name,
             );
-            pool.lock().unwrap().push(conn);
+            drop(guard); // explicit but not required — Drop handles it
             res
         })
         .await
@@ -339,7 +372,7 @@ fn build_table(
     }
     tx.commit()
         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-    println!("  SQLite table '{table_name}' built and committed.");
+    tracing::info!("SQLite table '{}' built and committed.", table_name);
     Ok(())
 }
 

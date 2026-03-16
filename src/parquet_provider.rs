@@ -194,13 +194,25 @@ impl PointLookupProvider for ParquetLookupProvider {
             .into_iter()
             .map(|((file_idx, rg_idx), mut kv_pairs)| {
                 let store = self.store.clone();
-                let file_key = self.file_keys[file_idx].clone();
-                let cached_meta = self.metadata_cache[file_idx].clone();
+                let file_key = self.file_keys.get(file_idx).cloned();
+                let cached_meta = self.metadata_cache.get(file_idx).cloned();
+                let n_files = self.file_keys.len();
                 let selected_parquet_cols = selected_parquet_cols.clone();
                 let out_schema = out_schema.clone();
                 let projection_owned = projection_owned.clone();
 
                 async move {
+                    let file_key = file_key.ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "packed key references file_idx={file_idx} but provider has {n_files} files"
+                        ))
+                    })?;
+                    let cached_meta = cached_meta.ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "packed key references file_idx={file_idx} but metadata cache has {n_files} entries"
+                        ))
+                    })?;
+
                     let path = Path::parse(&file_key)
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -313,12 +325,16 @@ impl PointLookupProvider for ParquetLookupProvider {
                             idxs.iter()
                                 .map(|&i| {
                                     if i == 0 {
-                                        row_idx_arr.clone()
+                                        Ok(row_idx_arr.clone())
                                     } else {
-                                        content.next().expect("column mismatch")
+                                        content.next().ok_or_else(|| {
+                                            DataFusionError::Execution(
+                                                "projection column mismatch".into(),
+                                            )
+                                        })
                                     }
                                 })
-                                .collect()
+                                .collect::<Result<Vec<_>>>()?
                         }
                     };
 
