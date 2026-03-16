@@ -271,7 +271,7 @@ fn execute_query_sync(
         }
     }
 
-    if col_bufs[0].is_empty() {
+    if col_bufs.first().is_none_or(|v| v.is_empty()) {
         return Ok(vec![]);
     }
 
@@ -331,7 +331,7 @@ fn build_table(
             if f.name() == "row_idx" {
                 "row_idx INTEGER PRIMARY KEY".to_string()
             } else {
-                format!("\"{}\" {}", f.name(), sql_type)
+                format!("{} {}", quote_ident(f.name()), sql_type)
             }
         })
         .collect::<Vec<_>>()
