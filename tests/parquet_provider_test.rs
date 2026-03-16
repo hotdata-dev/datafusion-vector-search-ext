@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, StringArray, UInt64Array};
+use arrow_array::{RecordBatch, StringArray, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::catalog::TableProvider;
+use datafusion::prelude::SessionContext;
 use datafusion_vector_search_ext::{ParquetLookupProvider, PointLookupProvider, pack_key};
 use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
@@ -180,4 +182,116 @@ async fn test_row_selection_variant() {
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2);
+}
+
+/// Regression test for the projection column ordering bug:
+/// when `selected_parquet_cols` is not monotonically increasing,
+/// `ProjectionMask::roots` still returns columns in parquet schema order.
+/// The provider must reorder them back to match the requested `idxs` order.
+#[tokio::test]
+async fn test_projection_non_monotonic_column_order() {
+    let dir = tempdir().unwrap();
+
+    // Parquet schema: col_a (UInt32, parquet idx 0), col_b (Utf8, parquet idx 1).
+    let parquet_schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::UInt32, false),
+        Field::new("col_b", DataType::Utf8, true),
+    ]));
+    // Provider schema: row_idx (idx 0), col_a (idx 1, parquet 0), col_b (idx 2, parquet 1).
+    let provider_schema = Arc::new(Schema::new(vec![
+        Field::new("row_idx", DataType::UInt64, false),
+        Field::new("col_a", DataType::UInt32, false),
+        Field::new("col_b", DataType::Utf8, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        parquet_schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(vec![10u32, 20, 30])),
+            Arc::new(StringArray::from(vec![
+                Some("alice"),
+                Some("bob"),
+                Some("carol"),
+            ])),
+        ],
+    )
+    .unwrap();
+
+    let file_path = dir.path().join("two_col.parquet");
+    let file = std::fs::File::create(&file_path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, parquet_schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    // parquet_col_indices: provider col 1 → parquet col 0 (col_a),
+    //                      provider col 2 → parquet col 1 (col_b).
+    let provider = ParquetLookupProvider::new(
+        vec!["two_col.parquet".to_string()],
+        store,
+        provider_schema,
+        vec![0, 1],
+    )
+    .await
+    .unwrap();
+
+    // Project [col_b (2), col_a (1)] — reverse order, non-monotonic parquet indices.
+    // selected_parquet_cols becomes [1, 0]; without the reorder fix the values
+    // would be swapped (col_a value 10 returned as col_b, etc.).
+    let key0 = pack_key(0, 0, 0);
+    let batches = provider
+        .fetch_by_keys(&[key0], "row_idx", Some(&[2, 1]))
+        .await
+        .unwrap();
+
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.schema().field(0).name(), "col_b");
+    assert_eq!(batch.schema().field(1).name(), "col_a");
+
+    let col_b = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let col_a = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    assert_eq!(col_b.value(0), "alice");
+    assert_eq!(col_a.value(0), 10);
+}
+
+/// Regression test for the stale-key bounds check:
+/// a packed key referencing a file_idx beyond the provider's file list must
+/// return Err, not panic via an out-of-bounds index.
+#[tokio::test]
+async fn test_stale_file_idx_returns_error() {
+    let dir = tempdir().unwrap();
+    let provider = make_provider(&dir).await; // single-file provider (file_idx 0 only)
+
+    let stale_key = pack_key(1, 0, 0); // file_idx=1 doesn't exist
+    let result = provider.fetch_by_keys(&[stale_key], "row_idx", None).await;
+    assert!(result.is_err(), "expected Err for out-of-bounds file_idx");
+    assert!(result.unwrap_err().to_string().contains("file_idx=1"));
+}
+
+/// Regression test for the silent-empty-scan bug:
+/// scan() used to return an empty MemTable, producing zero rows with no error.
+/// It must now return NotImplemented so callers get a clear failure.
+#[tokio::test]
+async fn test_scan_returns_not_implemented() {
+    let dir = tempdir().unwrap();
+    let provider = make_provider(&dir).await;
+
+    let ctx = SessionContext::new();
+    let state = ctx.state();
+    let result = provider.scan(&state, None, &[], None).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("not support full table scans"),
+        "expected NotImplemented error, got: {err}"
+    );
 }

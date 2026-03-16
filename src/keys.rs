@@ -105,3 +105,47 @@ impl DatasetLayout {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pack_unpack_roundtrip() {
+        let cases = [
+            (0, 0, 0),
+            (1, 2, 3),
+            (65535, 65535, u32::MAX as usize),
+            (0, 0, u32::MAX as usize),
+        ];
+        for (fi, rg, lo) in cases {
+            let key = pack_key(fi, rg, lo);
+            assert_eq!(unpack_key(key), (fi, rg, lo));
+        }
+    }
+
+    #[test]
+    fn test_pack_key_boundary_values() {
+        // u32::MAX as local_offset is within range and must round-trip cleanly.
+        let key = pack_key(0, 0, u32::MAX as usize);
+        let (_, _, lo) = unpack_key(key);
+        assert_eq!(lo, u32::MAX as usize);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "overflows 32 bits")]
+    fn test_pack_key_local_offset_overflow_panics_in_debug() {
+        // This is the bug fixed by using u32::MAX as usize instead of (1 << 32):
+        // on 64-bit platforms the old expression compiled but the assertion was
+        // wrong; on 32-bit platforms it would have panicked unconditionally.
+        pack_key(0, 0, u32::MAX as usize + 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "overflows 16 bits")]
+    fn test_pack_key_file_idx_overflow_panics_in_debug() {
+        pack_key(1 << 16, 0, 0);
+    }
+}
