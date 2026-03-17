@@ -106,6 +106,7 @@ async fn make_exec_ctx(reg_key: &str) -> SessionContext {
         reg_key,
         make_populated_index(),
         provider.clone(),
+        provider.clone(),
         "id",
         MetricKind::L2sq,
         ScalarKind::F32,

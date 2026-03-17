@@ -145,7 +145,7 @@ impl ExtensionPlanner for USearchExecPlanner {
         let provider_scan = if !node.filters.is_empty() {
             Some(
                 registered
-                    .provider
+                    .scan_provider
                     .scan(session_state, None, &[], None)
                     .await?,
             )
@@ -313,7 +313,7 @@ async fn usearch_execute(
             .collect();
 
         let data_batches = registered
-            .provider
+            .lookup_provider
             .fetch_by_keys(&matches.keys, &params.key_col, None)
             .await?;
 
@@ -352,7 +352,7 @@ async fn adaptive_filtered_execute(
     scan_plan: Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
 ) -> Result<Vec<RecordBatch>> {
-    let provider_schema = registered.provider.schema();
+    let provider_schema = registered.scan_provider.schema();
     let key_col_idx = provider_key_col_idx(registered)?;
     let vec_col_idx = provider_schema.index_of(&params.vector_col).ok();
     let has_vec_col = vec_col_idx.is_some();
@@ -445,7 +445,7 @@ async fn adaptive_filtered_execute(
         let top_keys: Vec<u64> = top_k.iter().map(|(k, _)| *k).collect();
 
         let data_batches = registered
-            .provider
+            .lookup_provider
             .fetch_by_keys(&top_keys, &params.key_col, None)
             .await?;
 
@@ -486,7 +486,7 @@ async fn adaptive_filtered_execute(
             .collect();
 
         let data_batches = registered
-            .provider
+            .lookup_provider
             .fetch_by_keys(&matches.keys, &params.key_col, None)
             .await?;
 
@@ -729,15 +729,15 @@ fn heap_select_top_k(pairs: &mut [(u64, f32)], k: usize) -> Vec<(u64, f32)> {
     result
 }
 
-/// Index of the key column in the provider schema.
+/// Index of the key column in the lookup provider schema.
 fn provider_key_col_idx(registered: &crate::registry::RegisteredTable) -> Result<usize> {
     registered
-        .provider
+        .lookup_provider
         .schema()
         .index_of(&registered.key_col)
         .map_err(|_| {
             DataFusionError::Execution(format!(
-                "USearchExecPlanner: key column '{}' not found in provider schema",
+                "USearchExecPlanner: key column '{}' not found in lookup provider schema",
                 registered.key_col
             ))
         })

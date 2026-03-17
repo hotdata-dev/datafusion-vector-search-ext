@@ -62,6 +62,7 @@ async fn make_ctx(metric: MetricKind) -> SessionContext {
         "items::vector",
         make_index(metric),
         provider.clone(),
+        provider.clone(),
         "id",
         metric,
         ScalarKind::F32,
@@ -346,6 +347,7 @@ async fn make_ctx_qualified(metric: MetricKind) -> SessionContext {
     reg.add(
         "datafusion::public::items::vector",
         make_index(metric),
+        provider.clone(),
         provider.clone(),
         "id",
         metric,

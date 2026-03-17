@@ -25,7 +25,7 @@ use datafusion::physical_plan::ExecutionPlan;
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
-/// A [`TableProvider`] that guarantees efficient row retrieval by primary key.
+/// Trait for efficient row retrieval by primary key.
 ///
 /// Implementors provide O(k) or O(k log N) row lookups — no full-table scan.
 /// The `USearchRegistry` requires this trait instead of a bare `TableProvider`
@@ -33,6 +33,8 @@ use datafusion::physical_plan::ExecutionPlan;
 ///
 /// # Contract
 ///
+/// - `schema()` MUST return the Arrow schema of the rows returned by
+///   `fetch_by_keys` (when `projection` is `None`).
 /// - `fetch_by_keys` MUST return only rows whose key column value is in `keys`.
 /// - Keys not found in the table are silently omitted — not an error.
 /// - Returned batches must use a schema consistent with `self.schema()`. When
@@ -46,6 +48,8 @@ use datafusion::physical_plan::ExecutionPlan;
 /// ```rust,ignore
 /// #[async_trait]
 /// impl PointLookupProvider for MyEngineTable {
+///     fn schema(&self) -> SchemaRef { self.schema.clone() }
+///
 ///     async fn fetch_by_keys(
 ///         &self,
 ///         keys: &[u64],
@@ -60,7 +64,10 @@ use datafusion::physical_plan::ExecutionPlan;
 /// }
 /// ```
 #[async_trait]
-pub trait PointLookupProvider: TableProvider + Send + Sync {
+pub trait PointLookupProvider: Send + Sync {
+    /// Arrow schema of the rows this provider returns (without `_distance`).
+    fn schema(&self) -> SchemaRef;
+
     async fn fetch_by_keys(
         &self,
         keys: &[u64],
@@ -145,6 +152,10 @@ impl fmt::Debug for HashKeyProvider {
 
 #[async_trait]
 impl PointLookupProvider for HashKeyProvider {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
     async fn fetch_by_keys(
         &self,
         keys: &[u64],
