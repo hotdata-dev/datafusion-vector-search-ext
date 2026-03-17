@@ -459,10 +459,7 @@ impl ExecutionPlan for SqliteFullScanExec {
                     .collect::<Vec<_>>()
                     .join(", ");
                 // No ORDER BY — the adaptive filter doesn't require ordering.
-                let sql = format!(
-                    "SELECT {col_list} FROM {}",
-                    quote_ident(&table_name)
-                );
+                let sql = format!("SELECT {col_list} FROM {}", quote_ident(&table_name));
 
                 let mut stmt = match conn.prepare(&sql) {
                     Ok(s) => s,
@@ -529,18 +526,18 @@ impl ExecutionPlan for SqliteFullScanExec {
                         }
                         Ok(None) => break,
                         Err(e) => {
-                            let _ = tx_c
-                                .blocking_send(Err(DataFusionError::Execution(e.to_string())));
+                            let _ =
+                                tx_c.blocking_send(Err(DataFusionError::Execution(e.to_string())));
                             return;
                         }
                     }
                 }
 
                 // Flush the last partial batch.
-                if rows_in_batch > 0 {
-                    if let Ok(batch) = build_scan_batch(&schema_task, col_bufs) {
-                        let _ = tx_c.blocking_send(Ok(batch));
-                    }
+                if rows_in_batch > 0
+                    && let Ok(batch) = build_scan_batch(&schema_task, col_bufs)
+                {
+                    let _ = tx_c.blocking_send(Ok(batch));
                 }
             })
             .await;
