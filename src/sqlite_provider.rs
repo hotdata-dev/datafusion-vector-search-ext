@@ -448,7 +448,7 @@ impl ExecutionPlan for SqliteFullScanExec {
 
             let pool_c = pool.clone();
             let tx_c = tx.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = tokio::task::spawn_blocking(move || {
                 let guard = ConnGuard::new(pool_c, conn);
                 let conn = guard.conn.as_ref().unwrap();
 
@@ -534,13 +534,25 @@ impl ExecutionPlan for SqliteFullScanExec {
                 }
 
                 // Flush the last partial batch.
-                if rows_in_batch > 0
-                    && let Ok(batch) = build_scan_batch(&schema_task, col_bufs)
-                {
-                    let _ = tx_c.blocking_send(Ok(batch));
+                if rows_in_batch > 0 {
+                    match build_scan_batch(&schema_task, col_bufs) {
+                        Ok(batch) => {
+                            let _ = tx_c.blocking_send(Ok(batch));
+                        }
+                        Err(e) => {
+                            let _ = tx_c.blocking_send(Err(e));
+                        }
+                    }
                 }
             })
-            .await;
+            .await
+            {
+                let _ = tx
+                    .send(Err(DataFusionError::Execution(format!(
+                        "scan task panicked: {e}"
+                    ))))
+                    .await;
+            }
         });
 
         // Convert the channel receiver into a RecordBatch stream.
