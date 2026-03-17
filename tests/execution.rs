@@ -257,6 +257,51 @@ async fn exec_qualified_where_order_by_alias() {
     assert_eq!(ids[0], 1, "closest alpha row must be row 1\nids: {ids:?}");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Registration validation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Registration must fail when scan_provider schema is missing the key column.
+#[tokio::test]
+async fn reg_scan_provider_missing_key_col_errors() {
+    // scan_provider schema: only "label" and "vector" — no "id".
+    let scan_schema = Arc::new(Schema::new(vec![
+        Field::new("label", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+            false,
+        ),
+    ]));
+    let scan_provider =
+        Arc::new(HashKeyProvider::try_new(scan_schema, vec![], "label").expect("HashKeyProvider"));
+
+    // lookup_provider has "id".
+    let lookup_schema = exec_schema();
+    let lookup_provider =
+        Arc::new(HashKeyProvider::try_new(lookup_schema, vec![], "id").expect("HashKeyProvider"));
+
+    let reg = USearchRegistry::new();
+    let result = reg.add(
+        "test::vector",
+        make_populated_index(),
+        scan_provider,
+        lookup_provider,
+        "id",
+        MetricKind::L2sq,
+        ScalarKind::F32,
+    );
+    assert!(
+        result.is_err(),
+        "registration must fail when scan_provider lacks key column"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("scan provider"),
+        "error must mention scan provider: {msg}"
+    );
+}
+
 /// Qualified table, WHERE clause, ORDER BY UDF directly.
 #[tokio::test]
 async fn exec_qualified_where_order_by_udf() {

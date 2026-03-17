@@ -278,7 +278,13 @@ impl USearchRegistry {
 
         let _ = data_schema.index_of(key_col).map_err(|_| {
             DataFusionError::Execution(format!(
-                "USearchRegistry: key column '{key_col}' not found in table '{name}' schema"
+                "USearchRegistry: key column '{key_col}' not found in lookup provider schema for table '{name}'"
+            ))
+        })?;
+
+        let _ = scan_provider.schema().index_of(key_col).map_err(|_| {
+            DataFusionError::Execution(format!(
+                "USearchRegistry: key column '{key_col}' not found in scan provider schema for table '{name}'"
             ))
         })?;
 
