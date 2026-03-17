@@ -498,6 +498,11 @@ impl ExecutionPlan for SqliteFullScanExec {
                                 }
                             }
                             if !row_ok {
+                                // Discard partial row data so the final flush
+                                // doesn't see mismatched column buffer lengths.
+                                for buf in col_bufs.iter_mut() {
+                                    buf.truncate(rows_in_batch);
+                                }
                                 break;
                             }
                             rows_in_batch += 1;
