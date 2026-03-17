@@ -428,20 +428,18 @@ impl ExecutionPlan for SqliteFullScanExec {
                 }
             };
 
-            let conn = {
-                match pool.lock() {
-                    Ok(mut g) => g.pop(),
-                    Err(_) => None,
-                }
+            let conn = match pool.lock() {
+                Ok(mut g) => g.pop().ok_or_else(|| {
+                    DataFusionError::Execution("SqliteFullScanExec: connection pool empty".into())
+                }),
+                Err(e) => Err(DataFusionError::Execution(format!(
+                    "connection pool mutex poisoned: {e}"
+                ))),
             };
             let conn = match conn {
-                Some(c) => c,
-                None => {
-                    let _ = tx
-                        .send(Err(DataFusionError::Execution(
-                            "SqliteFullScanExec: connection pool empty".into(),
-                        )))
-                        .await;
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
                     return;
                 }
             };
