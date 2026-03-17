@@ -6,9 +6,7 @@ use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::catalog::TableProvider;
 use datafusion::prelude::SessionContext;
-use datafusion_vector_search_ext::{
-    DatasetLayout, PointLookupProvider, SqliteLookupProvider, pack_key,
-};
+use datafusion_vector_search_ext::{PointLookupProvider, SqliteLookupProvider};
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
 
@@ -38,13 +36,6 @@ fn make_provider(dir: &tempfile::TempDir) -> SqliteLookupProvider {
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 
-    // Build a minimal DatasetLayout for 1 file with 1 row group of 3 rows.
-    let layout = DatasetLayout {
-        file_keys: vec!["parquet/test.parquet".to_string()],
-        file_cum_rows: vec![0, 3],
-        rg_cum_rows: vec![vec![0, 3]],
-    };
-
     let db_path = dir.path().join("test.db");
     let parquet_files = vec![parquet_path.to_str().unwrap().to_string()];
 
@@ -53,7 +44,6 @@ fn make_provider(dir: &tempfile::TempDir) -> SqliteLookupProvider {
         "models",
         4,
         &parquet_files,
-        &layout,
         provider_schema,
         &[0], // parquet col 0 (name) → provider col 1
     )
@@ -65,10 +55,8 @@ async fn test_fetch_existing_keys() {
     let dir = tempdir().unwrap();
     let provider = make_provider(&dir);
 
-    let key0 = pack_key(0, 0, 0);
-    let key2 = pack_key(0, 0, 2);
     let batches = provider
-        .fetch_by_keys(&[key0, key2], "row_idx", None)
+        .fetch_by_keys(&[0, 2], "row_idx", None)
         .await
         .unwrap();
 
@@ -98,10 +86,9 @@ async fn test_projection() {
     let dir = tempdir().unwrap();
     let provider = make_provider(&dir);
 
-    let key1 = pack_key(0, 0, 1);
     // Project only row_idx (index 0).
     let batches = provider
-        .fetch_by_keys(&[key1], "row_idx", Some(&[0]))
+        .fetch_by_keys(&[1], "row_idx", Some(&[0]))
         .await
         .unwrap();
 
@@ -114,7 +101,7 @@ async fn test_projection() {
         .as_any()
         .downcast_ref::<UInt64Array>()
         .unwrap();
-    assert_eq!(row_idx_col.value(0), key1);
+    assert_eq!(row_idx_col.value(0), 1);
 }
 
 #[tokio::test]
@@ -122,9 +109,8 @@ async fn test_missing_keys_return_empty() {
     let dir = tempdir().unwrap();
     let provider = make_provider(&dir);
 
-    let missing = pack_key(0, 0, 99); // offset 99 doesn't exist
     let batches = provider
-        .fetch_by_keys(&[missing], "row_idx", None)
+        .fetch_by_keys(&[99], "row_idx", None)
         .await
         .unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -203,12 +189,6 @@ async fn test_table_name_with_spaces() {
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 
-    let layout = DatasetLayout {
-        file_keys: vec!["parquet/test.parquet".to_string()],
-        file_cum_rows: vec![0, 1],
-        rg_cum_rows: vec![vec![0, 1]],
-    };
-
     let db_path = dir.path().join("test.db");
     // Table name with spaces — previously this would have produced a SQL syntax error.
     let provider = SqliteLookupProvider::open_or_build(
@@ -216,16 +196,11 @@ async fn test_table_name_with_spaces() {
         "my models",
         2,
         &[parquet_path.to_str().unwrap().to_string()],
-        &layout,
         provider_schema,
         &[0],
     )
     .unwrap();
 
-    let key0 = pack_key(0, 0, 0);
-    let batches = provider
-        .fetch_by_keys(&[key0], "row_idx", None)
-        .await
-        .unwrap();
+    let batches = provider.fetch_by_keys(&[0], "row_idx", None).await.unwrap();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 }
