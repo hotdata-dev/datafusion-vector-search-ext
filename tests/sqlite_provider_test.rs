@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, StringArray, UInt64Array};
+use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::catalog::TableProvider;
 use datafusion::prelude::SessionContext;
@@ -140,23 +140,43 @@ async fn test_empty_key_slice() {
     assert!(batches.is_empty());
 }
 
-/// Regression test for the silent-empty-scan bug:
-/// scan() used to return an empty MemTable, producing zero rows with no error.
-/// It must now return NotImplemented so callers get a clear failure.
+/// scan() returns a streaming ExecutionPlan that yields all rows in batches.
 #[tokio::test]
-async fn test_scan_returns_not_implemented() {
+async fn test_scan_streams_all_rows() {
+    use datafusion::execution::TaskContext;
+    use futures::StreamExt;
+
     let dir = tempdir().unwrap();
     let provider = make_provider(&dir);
 
     let ctx = SessionContext::new();
     let state = ctx.state();
-    let result = provider.scan(&state, None, &[], None).await;
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("not support full table scans"),
-        "expected NotImplemented error, got: {err}"
-    );
+    let plan = provider.scan(&state, None, &[], None).await.unwrap();
+
+    let task_ctx = Arc::new(TaskContext::default());
+    let mut stream = plan.execute(0, task_ctx).unwrap();
+
+    let mut total_rows = 0usize;
+    let mut all_names: Vec<String> = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.unwrap();
+        total_rows += batch.num_rows();
+
+        let names_col = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..names_col.len() {
+            all_names.push(names_col.value(i).to_string());
+        }
+    }
+
+    assert_eq!(total_rows, 3);
+    assert!(all_names.contains(&"alice".to_string()));
+    assert!(all_names.contains(&"bob".to_string()));
+    assert!(all_names.contains(&"carol".to_string()));
 }
 
 /// Regression test for the SQL injection fix via quote_ident:
