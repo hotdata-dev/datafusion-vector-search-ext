@@ -353,7 +353,15 @@ async fn adaptive_filtered_execute(
     task_ctx: Arc<TaskContext>,
 ) -> Result<Vec<RecordBatch>> {
     let provider_schema = registered.scan_provider.schema();
-    let key_col_idx = provider_key_col_idx(registered)?;
+    // Key column index in scan_provider schema — used when reading scan batches.
+    let scan_key_col_idx = provider_schema.index_of(&registered.key_col).map_err(|_| {
+        DataFusionError::Execution(format!(
+            "USearchExecPlanner: key column '{}' not found in scan provider schema",
+            registered.key_col
+        ))
+    })?;
+    // Key column index in lookup_provider schema — used by attach_distances.
+    let lookup_key_col_idx = provider_key_col_idx(registered)?;
     let vec_col_idx = provider_schema.index_of(&params.vector_col).ok();
     let has_vec_col = vec_col_idx.is_some();
 
@@ -371,7 +379,7 @@ async fn adaptive_filtered_execute(
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
             let mask = evaluate_filters(&params.physical_filters, &batch)?;
-            let keys = extract_keys_as_u64(batch.column(key_col_idx).as_ref())?;
+            let keys = extract_keys_as_u64(batch.column(scan_key_col_idx).as_ref())?;
 
             for row_idx in 0..batch.num_rows() {
                 if !mask.is_null(row_idx)
@@ -450,7 +458,7 @@ async fn adaptive_filtered_execute(
             .await?;
 
         let result_batches =
-            attach_distances(data_batches, key_col_idx, &key_to_dist, &params.schema)?;
+            attach_distances(data_batches, lookup_key_col_idx, &key_to_dist, &params.schema)?;
 
         tracing::Span::current().record(
             "usearch.result_count",
@@ -491,7 +499,7 @@ async fn adaptive_filtered_execute(
             .await?;
 
         let result_batches =
-            attach_distances(data_batches, key_col_idx, &key_to_dist, &params.schema)?;
+            attach_distances(data_batches, lookup_key_col_idx, &key_to_dist, &params.schema)?;
 
         tracing::Span::current().record(
             "usearch.result_count",
