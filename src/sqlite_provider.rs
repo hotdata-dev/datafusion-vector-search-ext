@@ -106,7 +106,9 @@ impl SqliteLookupProvider {
     /// connections (WAL allows N concurrent readers).
     ///
     /// `local_parquet_files`, `schema`, and `parquet_col_indices`
-    /// are only used if the table does not yet exist.
+    /// are only used if the table does not yet exist.  Row keys are assigned
+    /// as monotonic integers (0, 1, 2, …) in file-iteration order; any
+    /// USearch index used alongside this provider must use the same scheme.
     pub fn open_or_build(
         db_path: &str,
         table_name: &str,
