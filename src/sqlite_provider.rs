@@ -35,7 +35,6 @@ use datafusion::physical_plan::{
 use rusqlite::{Connection, types::Value as SqlValue};
 use tokio::sync::Semaphore;
 
-use crate::keys::{DatasetLayout, pack_key};
 use crate::lookup::PointLookupProvider;
 
 // ── Provider ──────────────────────────────────────────────────────────────────
@@ -106,15 +105,13 @@ impl SqliteLookupProvider {
     /// parquet files on first run.  Opens a pool of `pool_size` read
     /// connections (WAL allows N concurrent readers).
     ///
-    /// `local_parquet_files`, `layout`, `schema`, and `parquet_col_indices`
+    /// `local_parquet_files`, `schema`, and `parquet_col_indices`
     /// are only used if the table does not yet exist.
-    #[allow(clippy::too_many_arguments)]
     pub fn open_or_build(
         db_path: &str,
         table_name: &str,
         pool_size: usize,
         local_parquet_files: &[String],
-        layout: &DatasetLayout,
         schema: SchemaRef,
         parquet_col_indices: &[usize],
     ) -> DFResult<Self> {
@@ -156,7 +153,6 @@ impl SqliteLookupProvider {
                 &conn,
                 table_name,
                 local_parquet_files,
-                layout,
                 &schema,
                 parquet_col_indices,
             )?;
@@ -581,7 +577,6 @@ fn build_table(
     conn: &Connection,
     table_name: &str,
     parquet_files: &[String],
-    layout: &DatasetLayout,
     schema: &SchemaRef,
     parquet_col_indices: &[usize],
 ) -> DFResult<()> {
@@ -628,7 +623,9 @@ fn build_table(
             .prepare(&insert_sql)
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-        for (file_idx, file_path) in parquet_files.iter().enumerate() {
+        let mut global_row_idx: u64 = 0;
+
+        for file_path in parquet_files {
             let f = std::fs::File::open(file_path)
                 .map_err(|e| DataFusionError::Execution(format!("open {file_path}: {e}")))?;
             let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
@@ -637,20 +634,17 @@ fn build_table(
                 .with_batch_size(2048)
                 .build()
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            let mut file_row: u64 = 0;
 
             for batch_result in reader {
                 let batch = batch_result.map_err(|e| DataFusionError::Execution(e.to_string()))?;
                 let n = batch.num_rows();
 
                 for row_i in 0..n {
-                    let r = file_row + row_i as u64;
-                    let rg = layout.rg_cum_rows[file_idx].partition_point(|&s| s <= r) - 1;
-                    let lo = (r - layout.rg_cum_rows[file_idx][rg]) as usize;
-                    let packed_key = pack_key(file_idx, rg, lo);
+                    let key = global_row_idx;
+                    global_row_idx += 1;
 
                     let mut params: Vec<SqlValue> = Vec::with_capacity(schema.fields().len());
-                    params.push(SqlValue::Integer(packed_key as i64));
+                    params.push(SqlValue::Integer(key as i64));
 
                     for &ci in parquet_col_indices {
                         params.push(arrow_cell_to_sql(batch.column(ci), row_i));
@@ -659,7 +653,6 @@ fn build_table(
                     stmt.execute(rusqlite::params_from_iter(params.iter()))
                         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
                 }
-                file_row += n as u64;
             }
         }
     }
