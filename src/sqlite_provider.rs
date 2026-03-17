@@ -177,6 +177,10 @@ impl SqliteLookupProvider {
 
 #[async_trait]
 impl PointLookupProvider for SqliteLookupProvider {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
     async fn fetch_by_keys(
         &self,
         keys: &[u64],

@@ -8,6 +8,8 @@ use datafusion::common::Result;
 use datafusion::error::DataFusionError;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
+use datafusion::catalog::TableProvider;
+
 use crate::lookup::PointLookupProvider;
 
 // ── USearchIndexConfig ────────────────────────────────────────────────────────
@@ -177,7 +179,10 @@ impl Default for USearchTableConfig {
 
 pub struct RegisteredTable {
     pub index: Arc<Index>,
-    pub provider: Arc<dyn PointLookupProvider>,
+    /// Scan provider for WHERE evaluation and low-selectivity Parquet-native path.
+    pub scan_provider: Arc<dyn TableProvider>,
+    /// Lookup provider for efficient key-based row fetch (e.g. SQLite).
+    pub lookup_provider: Arc<dyn PointLookupProvider>,
     pub key_col: String,
     pub metric: MetricKind,
     /// Native scalar type of the vector column.  Determines which typed search
@@ -213,11 +218,13 @@ impl USearchRegistry {
     /// [`USearchTableConfig::default()`] (ef_search=64, threshold=5%).
     ///
     /// - `index` — must already be loaded / populated.
-    /// - `provider` — must implement [`PointLookupProvider`].
+    /// - `scan_provider` — [`TableProvider`] used for WHERE evaluation and
+    ///   low-selectivity Parquet-native scanning.
+    /// - `lookup_provider` — [`PointLookupProvider`] for O(k) key-based fetch.
     ///   [`HashKeyProvider`] is the bundled in-memory implementation.
-    ///   For production, implement the trait on your storage engine's table type.
-    /// - `key_col` — column in `provider.schema()` that stores the USearch key
-    ///   (`u64`).  Supported Arrow types: `UInt64`, `Int64`, `UInt32`, `Int32`.
+    /// - `key_col` — column in `lookup_provider.schema()` that stores the
+    ///   USearch key (`u64`).  Supported Arrow types: `UInt64`, `Int64`,
+    ///   `UInt32`, `Int32`.
     /// - `metric` — must match how the index was built.  The optimizer rule
     ///   validates this and refuses to rewrite on mismatch.
     /// - `scalar_kind` — native element type of the vector column (`F32` or
@@ -225,11 +232,13 @@ impl USearchRegistry {
     ///
     /// [`add_with_config`]: USearchRegistry::add_with_config
     /// [`HashKeyProvider`]: crate::lookup::HashKeyProvider
+    #[allow(clippy::too_many_arguments)]
     pub fn add(
         &self,
         name: &str,
         index: Arc<Index>,
-        provider: Arc<dyn PointLookupProvider>,
+        scan_provider: Arc<dyn TableProvider>,
+        lookup_provider: Arc<dyn PointLookupProvider>,
         key_col: &str,
         metric: MetricKind,
         scalar_kind: ScalarKind,
@@ -237,7 +246,8 @@ impl USearchRegistry {
         self.add_with_config(
             name,
             index,
-            provider,
+            scan_provider,
+            lookup_provider,
             key_col,
             metric,
             scalar_kind,
@@ -254,7 +264,8 @@ impl USearchRegistry {
         &self,
         name: &str,
         index: Arc<Index>,
-        provider: Arc<dyn PointLookupProvider>,
+        scan_provider: Arc<dyn TableProvider>,
+        lookup_provider: Arc<dyn PointLookupProvider>,
         key_col: &str,
         metric: MetricKind,
         scalar_kind: ScalarKind,
@@ -263,11 +274,17 @@ impl USearchRegistry {
         // Set ef_search once, here, before any query touches the index.
         index.change_expansion_search(config.expansion_search);
 
-        let data_schema = provider.schema();
+        let data_schema = lookup_provider.schema();
 
         let _ = data_schema.index_of(key_col).map_err(|_| {
             DataFusionError::Execution(format!(
-                "USearchRegistry: key column '{key_col}' not found in table '{name}' schema"
+                "USearchRegistry: key column '{key_col}' not found in lookup provider schema for table '{name}'"
+            ))
+        })?;
+
+        let _ = scan_provider.schema().index_of(key_col).map_err(|_| {
+            DataFusionError::Execution(format!(
+                "USearchRegistry: key column '{key_col}' not found in scan provider schema for table '{name}'"
             ))
         })?;
 
@@ -286,7 +303,8 @@ impl USearchRegistry {
                 name.to_string(),
                 Arc::new(RegisteredTable {
                     index,
-                    provider,
+                    scan_provider,
+                    lookup_provider,
                     key_col: key_col.to_string(),
                     metric,
                     scalar_kind,
