@@ -457,8 +457,12 @@ async fn adaptive_filtered_execute(
             .fetch_by_keys(&top_keys, &params.key_col, None)
             .await?;
 
-        let result_batches =
-            attach_distances(data_batches, lookup_key_col_idx, &key_to_dist, &params.schema)?;
+        let result_batches = attach_distances(
+            data_batches,
+            lookup_key_col_idx,
+            &key_to_dist,
+            &params.schema,
+        )?;
 
         tracing::Span::current().record(
             "usearch.result_count",
@@ -498,8 +502,12 @@ async fn adaptive_filtered_execute(
             .fetch_by_keys(&matches.keys, &params.key_col, None)
             .await?;
 
-        let result_batches =
-            attach_distances(data_batches, lookup_key_col_idx, &key_to_dist, &params.schema)?;
+        let result_batches = attach_distances(
+            data_batches,
+            lookup_key_col_idx,
+            &key_to_dist,
+            &params.schema,
+        )?;
 
         tracing::Span::current().record(
             "usearch.result_count",
