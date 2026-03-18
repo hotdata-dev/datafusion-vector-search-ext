@@ -533,11 +533,21 @@ async fn parquet_native_execute(
         ))
     })?;
 
-    // Compute output projection: full scan columns minus the vector column.
-    // This matches the lookup_provider schema (same column order).
-    let output_col_indices: Vec<usize> = (0..full_schema.fields().len())
-        .filter(|&i| i != vec_col_idx)
-        .collect();
+    // Map each lookup_provider field to its index in the full scan schema by name.
+    // This avoids silent column mismatches if the two schemas have different orderings.
+    let lookup_schema = registered.lookup_provider.schema();
+    let output_col_indices: Vec<usize> = lookup_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            full_schema.index_of(f.name()).map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "USearchExec: column '{}' from lookup schema not found in full scan schema",
+                    f.name()
+                ))
+            })
+        })
+        .collect::<Result<_>>()?;
 
     // Top-k heap: stores (distance, projected_row_slice).
     // At low selectivity (<=5%), the number of passing rows is small.
@@ -561,8 +571,8 @@ async fn parquet_native_execute(
                 registered.scalar_kind,
                 &params.distance_type,
             ) {
-                Ok(d) => d,
-                Err(_) => continue, // skip null vectors
+                Ok(d) if !d.is_nan() => d,
+                _ => continue, // skip null vectors and NaN distances
             };
 
             // Project the row to output columns (drop vector col), zero-copy slice.
