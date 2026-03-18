@@ -272,11 +272,11 @@ All three distance functions are **lower-is-closer**:
 
 | SQL function | Index metric | Kernel |
 |---|---|---|
-| `l2_distance(a, b)` | `L2sq` | `sqrt(sum((a_i - b_i)^2))` (UDF) / `sum((a_i - b_i)^2)` (index) |
+| `l2_distance(a, b)` | `L2sq` | `sum((a_i - b_i)^2)` |
 | `cosine_distance(a, b)` | `Cos` | `1 - dot(a,b) / (norm(a) * norm(b))` |
 | `negative_dot_product(a, b)` | `IP` | `-(a . b)` |
 
-Note: `l2_distance` UDF returns actual L2 (with sqrt) for human-readable distances; USearch uses L2sq internally (no sqrt). The sort order is identical.
+`l2_distance` returns squared L2 (no sqrt), matching USearch's `MetricKind::L2sq`. This ensures numeric consistency between the UDF, the rewritten index path, and the brute-force path.
 
 ### Running tests
 

@@ -22,12 +22,13 @@ use datafusion::scalar::ScalarValue;
 
 type Kernel = fn(&[f32], &[f32]) -> f32;
 
+// Returns L2sq (no sqrt) — matches USearch MetricKind::L2sq and keeps numeric
+// values consistent between the UDF path and the optimizer-rewritten index path.
 fn l2_kernel(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y) * (x - y))
         .sum::<f32>()
-        .sqrt()
 }
 
 fn cosine_kernel(a: &[f32], b: &[f32]) -> f32 {
