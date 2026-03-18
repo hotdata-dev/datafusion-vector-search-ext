@@ -2,9 +2,12 @@
 //
 // Stores all non-embedding columns in a local SQLite database (bundled libsqlite3).
 // Scalar columns map to INTEGER/TEXT/REAL; list columns are serialised as JSON TEXT.
-// Lookups use `WHERE row_idx IN (?, ...)` against the INTEGER PRIMARY KEY B-tree.
+// Lookups use `WHERE <key_col> IN (?, ...)` against the INTEGER PRIMARY KEY B-tree.
 //
-// Schema: row_idx INTEGER PRIMARY KEY, <col> TEXT/INTEGER/REAL, ...
+// Schema: <key_col> INTEGER PRIMARY KEY, <col> TEXT/INTEGER/REAL, ...
+//
+// The key column name is caller-provided (e.g. "_key") and must match the first
+// field in the schema passed to `open_or_build`.
 //
 // Persistence: the database is written once to the given path and reused on
 // subsequent runs. The first build reads all parquet files and inserts rows
@@ -42,6 +45,7 @@ use crate::lookup::PointLookupProvider;
 pub struct SqliteLookupProvider {
     schema: SchemaRef,
     table_name: String,
+    key_col: String,
     pool: Arc<Mutex<Vec<Connection>>>,
     sem: Arc<Semaphore>,
 }
@@ -117,6 +121,8 @@ impl SqliteLookupProvider {
         schema: SchemaRef,
         parquet_col_indices: &[usize],
     ) -> DFResult<Self> {
+        // The first field in the schema is the key column (INTEGER PRIMARY KEY).
+        let key_col = schema.field(0).name().clone();
         if pool_size == 0 {
             return Err(DataFusionError::Execution(
                 "pool_size must be at least 1".into(),
@@ -167,6 +173,7 @@ impl SqliteLookupProvider {
         Ok(Self {
             schema,
             table_name: table_name.to_string(),
+            key_col,
             pool: Arc::new(Mutex::new(conns)),
             sem: Arc::new(Semaphore::new(pool_size)),
         })
@@ -202,6 +209,7 @@ impl PointLookupProvider for SqliteLookupProvider {
         let keys_vec = keys.to_vec();
         let pool = self.pool.clone();
         let table_name = self.table_name.clone();
+        let key_col = self.key_col.clone();
 
         // Acquire a semaphore permit to bound concurrency to the pool size,
         // then run the synchronous SQLite query on a blocking thread.
@@ -227,6 +235,7 @@ impl PointLookupProvider for SqliteLookupProvider {
                 &keys_vec,
                 &out_schema,
                 &table_name,
+                &key_col,
             );
             drop(guard); // explicit but not required — Drop handles it
             res
@@ -243,6 +252,7 @@ fn execute_query_sync(
     keys: &[u64],
     out_schema: &SchemaRef,
     table_name: &str,
+    key_col: &str,
 ) -> DFResult<Vec<RecordBatch>> {
     let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
     // Select only the columns in out_schema (already projection-applied by the
@@ -253,8 +263,9 @@ fn execute_query_sync(
         .map(|f| quote_ident(f.name()))
         .collect::<Vec<_>>()
         .join(", ");
+    let qk = quote_ident(key_col);
     let sql = format!(
-        "SELECT {col_list} FROM {tn} WHERE row_idx IN ({placeholders}) ORDER BY row_idx",
+        "SELECT {col_list} FROM {tn} WHERE {qk} IN ({placeholders}) ORDER BY {qk}",
         tn = quote_ident(table_name)
     );
 
@@ -586,14 +597,16 @@ fn build_table(
     schema: &SchemaRef,
     parquet_col_indices: &[usize],
 ) -> DFResult<()> {
+    // The first field is the key column (INTEGER PRIMARY KEY).
+    let key_col_name = schema.field(0).name();
     let col_defs = schema
         .fields()
         .iter()
         .map(|f| {
-            let sql_type = arrow_type_to_sql(f.data_type());
-            if f.name() == "row_idx" {
-                "row_idx INTEGER PRIMARY KEY".to_string()
+            if f.name() == key_col_name {
+                format!("{} INTEGER PRIMARY KEY", quote_ident(f.name()))
             } else {
+                let sql_type = arrow_type_to_sql(f.data_type());
                 format!("{} {}", quote_ident(f.name()), sql_type)
             }
         })
