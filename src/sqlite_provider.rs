@@ -104,6 +104,88 @@ fn open_conn(db_path: &str) -> DFResult<Connection> {
     Ok(conn)
 }
 
+/// Ensure the key column has an index.  If the table was created with
+/// `INTEGER PRIMARY KEY` the rowid alias already serves as the index and
+/// this is a no-op.  For tables created without a PK (pre-fix builds) we
+/// create a secondary index so point lookups use the B-tree instead of a
+/// full table scan.
+fn ensure_key_index(conn: &Connection, table_name: &str, key_col: &str) -> DFResult<()> {
+    // Check if the key column is the INTEGER PRIMARY KEY (rowid alias).
+    // In that case SQLite already uses the rowid B-tree — no extra index needed.
+    let is_pk: bool = conn
+        .query_row(
+            &format!(
+                "SELECT pk FROM pragma_table_info({tn}) WHERE name = ?1",
+                tn = quote_ident(table_name)
+            ),
+            rusqlite::params![key_col],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|pk| pk > 0)
+        .unwrap_or(false);
+
+    if is_pk {
+        return Ok(());
+    }
+
+    // Check if any existing index covers the key column using pragmas
+    // (avoids brittle SQL text matching against sqlite_master).
+    let has_index: bool = {
+        let mut found = false;
+        let mut idx_stmt = conn
+            .prepare(&format!(
+                "SELECT name FROM pragma_index_list({tn})",
+                tn = quote_ident(table_name)
+            ))
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let idx_names: Vec<String> = idx_stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for idx_name in idx_names {
+            let col_name: Option<String> = conn
+                .query_row(
+                    &format!(
+                        "SELECT name FROM pragma_index_info({idx})",
+                        idx = quote_ident(&idx_name)
+                    ),
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            if col_name.as_deref() == Some(key_col) {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+
+    if has_index {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        "SQLite table '{}': key column '{}' has no index — creating one (one-time migration).",
+        table_name,
+        key_col,
+    );
+    conn.execute(
+        &format!(
+            "CREATE INDEX IF NOT EXISTS {idx} ON {tn}({col})",
+            idx = quote_ident(&format!("idx_{table_name}_{key_col}")),
+            tn = quote_ident(table_name),
+            col = quote_ident(key_col),
+        ),
+        [],
+    )
+    .map_err(|e| DataFusionError::Execution(format!("failed to create key index: {e}")))?;
+
+    tracing::info!("Created index on '{}'.'{}'", table_name, key_col,);
+    Ok(())
+}
+
 impl SqliteLookupProvider {
     /// Open the existing SQLite database at `db_path`, or build it from
     /// parquet files on first run.  Opens a pool of `pool_size` read
@@ -152,6 +234,10 @@ impl SqliteLookupProvider {
                 table_name,
                 n
             );
+            // Ensure the key column is indexed. Tables built before the
+            // INTEGER PRIMARY KEY fix may lack any index on the key column,
+            // turning every point lookup into a full table scan.
+            ensure_key_index(&conn, table_name, &key_col)?;
         } else {
             tracing::info!(
                 "First run: building SQLite table '{}' (one-time).",
