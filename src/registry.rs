@@ -153,8 +153,10 @@ pub struct USearchTableConfig {
     pub expansion_search: usize,
 
     /// Selectivity fraction below which the planner bypasses the HNSW index
-    /// and runs an exact brute-force search over only the rows that pass the
-    /// WHERE filter.
+    /// and uses the Parquet-native path: a full scan of the `scan_provider`
+    /// (all columns including vector), evaluating filters per batch,
+    /// computing distances inline, and maintaining a top-k heap. This path
+    /// avoids USearch and the `lookup_provider` entirely.
     ///
     /// At low selectivity, `filtered_search` must explore ~`k/selectivity`
     /// graph nodes before finding k passing candidates — eventually slower

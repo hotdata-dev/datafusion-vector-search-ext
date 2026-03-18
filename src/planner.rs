@@ -1,27 +1,30 @@
 // planner.rs — USearchQueryPlanner + USearchExecPlanner + USearchExec.
 //
 // The extension planner translates USearchNode (logical) into USearchExec
-// (physical).  Two execution paths depending on whether the node carries
-// absorbed WHERE-clause filters:
+// (physical).  Three execution paths depending on whether the node carries
+// absorbed WHERE-clause filters and the selectivity of those filters:
 //
-// ── No filters (original path) ───────────────────────────────────────────────
+// ── No filters ───────────────────────────────────────────────────────────────
 //   1. index.search() → (keys, distances)
-//   2. provider.fetch_by_keys() → exactly those k rows, O(k)
+//   2. lookup_provider.fetch_by_keys() → exactly those k rows, O(k)
 //   3. Attach _distance column.
 //
-// ── With filters (adaptive path) ─────────────────────────────────────────────
-//   1. Compile filter Exprs to PhysicalExprs.
-//   2. Full scan of the provider; evaluate filters per batch.
-//      Collect: valid_keys (HashSet<u64>) and per-valid-row (key, distance).
-//   3. selectivity = valid_keys.len() / index.size()
-//   4a. selectivity > threshold → filtered_search(query, k, |key| valid_keys.contains(key))
-//       Result: O(k) exact rows; correctness guaranteed by in-graph predicate.
-//   4b. selectivity ≤ threshold → skip HNSW; use pre-computed (key, distance)
-//       pairs, heap-select top-k, then fetch_by_keys.
-//       Cost: O(|valid| × d) ≪ O((k/sel) × M × d) at low selectivity.
+// ── With filters, high selectivity (> threshold) ─────────────────────────────
+//   1. Pre-scan: scan_provider with projection (scalar + _key cols only,
+//      no vector column) and filter pushdown. Collect valid_keys.
+//   2. selectivity = valid_keys.len() / index.size()
+//   3. filtered_search(query, k, |key| valid_keys.contains(key))
+//   4. lookup_provider.fetch_by_keys() → O(k) rows. Attach _distance.
+//
+// ── With filters, low selectivity (≤ threshold) — Parquet-native ─────────────
+//   1. Pre-scan: same as above, collect valid_keys and compute selectivity.
+//   2. Full scan: scan_provider with all columns (including vector) and
+//      filter pushdown. Evaluate WHERE per batch, compute distances for
+//      passing rows, maintain top-k heap. Return directly — no USearch,
+//      no lookup_provider.
 //
 // All I/O is deferred to USearchExec::execute() — plan_extension is purely
-// structural (validate registry entry + compile PhysicalExprs).
+// structural (validate registry entry, compile PhysicalExprs, build scan plans).
 //
 // The Sort node is kept in the logical plan so DataFusion handles ordering
 // by _distance / dist alias.
