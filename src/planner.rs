@@ -340,12 +340,20 @@ async fn usearch_execute(
 
     if params.physical_filters.is_empty() {
         // ── Unfiltered path ───────────────────────────────────────────────
-        let matches = usearch_search(
-            &registered.index,
-            &params.query_vec,
-            params.k,
-            params.scalar_kind,
-        )?;
+        let matches = {
+            let _span = tracing::info_span!(
+                "usearch_hnsw_search",
+                usearch.k = params.k,
+                usearch.dims = params.query_vec.len(),
+            )
+            .entered();
+            usearch_search(
+                &registered.index,
+                &params.query_vec,
+                params.k,
+                params.scalar_kind,
+            )?
+        };
 
         if matches.keys.is_empty() {
             return Ok(vec![]);
@@ -358,12 +366,21 @@ async fn usearch_execute(
             .map(|(&k, &d)| (k, d))
             .collect();
 
-        let data_batches = registered
-            .lookup_provider
-            .fetch_by_keys(&matches.keys, &params.key_col, None)
-            .await?;
+        let fetch_keys_count = matches.keys.len();
+        let data_batches = async {
+            registered
+                .lookup_provider
+                .fetch_by_keys(&matches.keys, &params.key_col, None)
+                .await
+        }
+        .instrument(tracing::info_span!(
+            "usearch_sqlite_fetch",
+            usearch.fetch_keys = fetch_keys_count,
+        ))
+        .await?;
 
         let key_col_idx = provider_key_col_idx(&registered)?;
+        let _span = tracing::info_span!("usearch_attach_distances").entered();
         attach_distances(data_batches, key_col_idx, &key_to_dist, &params.schema)
     } else {
         // ── Adaptive filtered path ────────────────────────────────────────
@@ -490,17 +507,28 @@ async fn adaptive_filtered_execute(
             .map(|(&k, &d)| (k, d))
             .collect();
 
-        let data_batches = registered
-            .lookup_provider
-            .fetch_by_keys(&matches.keys, &params.key_col, None)
-            .await?;
+        let fetch_keys_count = matches.keys.len();
+        let data_batches = async {
+            registered
+                .lookup_provider
+                .fetch_by_keys(&matches.keys, &params.key_col, None)
+                .await
+        }
+        .instrument(tracing::info_span!(
+            "usearch_sqlite_fetch",
+            usearch.fetch_keys = fetch_keys_count,
+        ))
+        .await?;
 
-        let result_batches = attach_distances(
-            data_batches,
-            lookup_key_col_idx,
-            &key_to_dist,
-            &params.schema,
-        )?;
+        let result_batches = {
+            let _span = tracing::info_span!("usearch_attach_distances").entered();
+            attach_distances(
+                data_batches,
+                lookup_key_col_idx,
+                &key_to_dist,
+                &params.schema,
+            )?
+        };
 
         tracing::Span::current().record(
             "usearch.result_count",
