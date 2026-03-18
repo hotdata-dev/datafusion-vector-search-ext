@@ -26,7 +26,7 @@ use datafusion::prelude::SessionContext;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 use datafusion_vector_search_ext::{
-    HashKeyProvider, USearchQueryPlanner, USearchRegistry, register_all,
+    HashKeyProvider, USearchQueryPlanner, USearchRegistry, USearchTableConfig, register_all,
 };
 
 // ── Schema & data ─────────────────────────────────────────────────────────────
@@ -316,4 +316,140 @@ async fn exec_qualified_where_order_by_udf() {
         !ids.contains(&1),
         "row 1 (alpha) must be filtered; got {ids:?}"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Parquet-native path — low-selectivity execution
+//
+// These tests force the parquet-native path by setting
+// brute_force_selectivity_threshold = 1.0, so ALL filtered queries bypass
+// HNSW+SQLite. The lookup_provider schema excludes the vector column,
+// matching the real Parquet+SQLite deployment.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Schema for the lookup provider — no vector column.
+fn lookup_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]))
+}
+
+/// Build context that forces the parquet-native path for all filtered queries.
+async fn make_parquet_native_ctx(reg_key: &str) -> SessionContext {
+    let schema = exec_schema();
+    let batch = test_batch(&schema);
+
+    // scan_provider: full schema including vector column (simulates Parquet)
+    let scan_provider = Arc::new(
+        HashKeyProvider::try_new(schema.clone(), vec![batch.clone()], "id")
+            .expect("scan HashKeyProvider"),
+    );
+
+    // lookup_provider: no vector column (simulates SQLite)
+    let lookup_batch = {
+        let ids = batch.column(0).clone();
+        let labels = batch.column(1).clone();
+        RecordBatch::try_new(lookup_schema(), vec![ids, labels]).expect("lookup batch")
+    };
+    let lookup_provider = Arc::new(
+        HashKeyProvider::try_new(lookup_schema(), vec![lookup_batch], "id")
+            .expect("lookup HashKeyProvider"),
+    );
+
+    let reg = USearchRegistry::new();
+    reg.add_with_config(
+        reg_key,
+        make_populated_index(),
+        scan_provider,
+        lookup_provider,
+        "id",
+        MetricKind::L2sq,
+        ScalarKind::F32,
+        USearchTableConfig {
+            brute_force_selectivity_threshold: 1.0, // force parquet-native for all filters
+            ..Default::default()
+        },
+    )
+    .expect("reg.add_with_config");
+    let registry = reg.into_arc();
+
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_query_planner(Arc::new(USearchQueryPlanner::new(registry.clone())))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    register_all(&ctx, registry).expect("register_all");
+
+    // Register scan_provider as the table (so DataFusion can resolve column refs).
+    let table_provider = Arc::new(
+        HashKeyProvider::try_new(exec_schema(), vec![test_batch(&exec_schema())], "id")
+            .expect("table HashKeyProvider"),
+    );
+    ctx.register_table("items", table_provider)
+        .expect("register_table");
+    ctx
+}
+
+/// Parquet-native: WHERE excludes rows, results must respect filter and distance ordering.
+#[tokio::test]
+async fn exec_parquet_native_where_clause() {
+    let ctx = make_parquet_native_ctx("items::vector").await;
+    let sql = format!(
+        "SELECT id FROM items WHERE label != 'alpha' ORDER BY l2_distance(vector, {Q}) ASC LIMIT 2"
+    );
+    let ids = collect_ids(&ctx, &sql).await;
+    assert!(ids.contains(&2), "row 2 (beta) must appear; got {ids:?}");
+    assert!(ids.contains(&3), "row 3 (gamma) must appear; got {ids:?}");
+    assert!(
+        !ids.contains(&1),
+        "row 1 (alpha) must be filtered out; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&4),
+        "row 4 (alpha) must be filtered out; got {ids:?}"
+    );
+}
+
+/// Parquet-native: equality filter, verify distance ordering.
+#[tokio::test]
+async fn exec_parquet_native_equality_filter() {
+    let ctx = make_parquet_native_ctx("items::vector").await;
+    let sql = format!(
+        "SELECT id, l2_distance(vector, {Q}) AS dist FROM items WHERE label = 'alpha' ORDER BY dist ASC LIMIT 2"
+    );
+    let ids = collect_ids(&ctx, &sql).await;
+    // Rows 1 and 4 match label='alpha'. Row 1 is closer (L2sq=0 vs L2sq=2).
+    assert_eq!(
+        ids[0], 1,
+        "closest alpha row must be row 1 (dist=0)\nids: {ids:?}"
+    );
+    assert!(ids.contains(&4), "row 4 must be in results\nids: {ids:?}");
+}
+
+/// Parquet-native: LIMIT < matching rows, verifies top-k heap eviction works.
+#[tokio::test]
+async fn exec_parquet_native_limit_fewer_than_matches() {
+    let ctx = make_parquet_native_ctx("items::vector").await;
+    let sql = format!(
+        "SELECT id FROM items WHERE label != 'alpha' ORDER BY l2_distance(vector, {Q}) ASC LIMIT 1"
+    );
+    let ids = collect_ids(&ctx, &sql).await;
+    assert_eq!(ids.len(), 1, "exactly 1 result expected; got {ids:?}");
+    // Rows 2 and 3 both have L2sq=2 from query; either is valid, but only 1 returned.
+    assert!(
+        ids[0] == 2 || ids[0] == 3,
+        "must be row 2 or 3; got {ids:?}"
+    );
+}
+
+/// Parquet-native: WHERE filters all rows, must return empty.
+#[tokio::test]
+async fn exec_parquet_native_where_no_matches() {
+    let ctx = make_parquet_native_ctx("items::vector").await;
+    let sql = format!(
+        "SELECT id FROM items WHERE label = 'nonexistent' ORDER BY l2_distance(vector, {Q}) ASC LIMIT 2"
+    );
+    let ids = collect_ids(&ctx, &sql).await;
+    assert!(ids.is_empty(), "no rows should match; got {ids:?}");
 }

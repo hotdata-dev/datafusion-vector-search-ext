@@ -1,27 +1,30 @@
 // planner.rs — USearchQueryPlanner + USearchExecPlanner + USearchExec.
 //
 // The extension planner translates USearchNode (logical) into USearchExec
-// (physical).  Two execution paths depending on whether the node carries
-// absorbed WHERE-clause filters:
+// (physical).  Three execution paths depending on whether the node carries
+// absorbed WHERE-clause filters and the selectivity of those filters:
 //
-// ── No filters (original path) ───────────────────────────────────────────────
+// ── No filters ───────────────────────────────────────────────────────────────
 //   1. index.search() → (keys, distances)
-//   2. provider.fetch_by_keys() → exactly those k rows, O(k)
+//   2. lookup_provider.fetch_by_keys() → exactly those k rows, O(k)
 //   3. Attach _distance column.
 //
-// ── With filters (adaptive path) ─────────────────────────────────────────────
-//   1. Compile filter Exprs to PhysicalExprs.
-//   2. Full scan of the provider; evaluate filters per batch.
-//      Collect: valid_keys (HashSet<u64>) and per-valid-row (key, distance).
-//   3. selectivity = valid_keys.len() / index.size()
-//   4a. selectivity > threshold → filtered_search(query, k, |key| valid_keys.contains(key))
-//       Result: O(k) exact rows; correctness guaranteed by in-graph predicate.
-//   4b. selectivity ≤ threshold → skip HNSW; use pre-computed (key, distance)
-//       pairs, heap-select top-k, then fetch_by_keys.
-//       Cost: O(|valid| × d) ≪ O((k/sel) × M × d) at low selectivity.
+// ── With filters, high selectivity (> threshold) ─────────────────────────────
+//   1. Pre-scan: scan_provider with projection (scalar + _key cols only,
+//      no vector column) and filter pushdown. Collect valid_keys.
+//   2. selectivity = valid_keys.len() / index.size()
+//   3. filtered_search(query, k, |key| valid_keys.contains(key))
+//   4. lookup_provider.fetch_by_keys() → O(k) rows. Attach _distance.
+//
+// ── With filters, low selectivity (≤ threshold) — Parquet-native ─────────────
+//   1. Pre-scan: same as above, collect valid_keys and compute selectivity.
+//   2. Full scan: scan_provider with all columns (including vector) and
+//      filter pushdown. Evaluate WHERE per batch, compute distances for
+//      passing rows, maintain top-k heap. Return directly — no USearch,
+//      no lookup_provider.
 //
 // All I/O is deferred to USearchExec::execute() — plan_extension is purely
-// structural (validate registry entry + compile PhysicalExprs).
+// structural (validate registry entry, compile PhysicalExprs, build scan plans).
 //
 // The Sort node is kept in the logical plan so DataFusion handles ordering
 // by _distance / dist alias.
@@ -139,18 +142,40 @@ impl ExtensionPlanner for USearchExecPlanner {
             .map(|f| create_physical_expr(f, &node.schema, exec_props))
             .collect::<Result<_>>()?;
 
-        // For the filtered path, pre-plan the provider scan using SessionState.
-        // The scan plan itself is cheap to create (no data moved); actual
-        // iteration is deferred to execute() time via scan_plan.execute(0, ctx).
-        let provider_scan = if !node.filters.is_empty() {
-            Some(
-                registered
-                    .scan_provider
-                    .scan(session_state, None, &[], None)
-                    .await?,
-            )
+        // For the filtered path, pre-plan two provider scans:
+        // 1. Pre-scan (scalar + _key only, no vector col) — cheap selectivity estimation.
+        // 2. Full scan (all cols including vector) — only executed at runtime if low-sel.
+        // Both scans receive the node's WHERE filters for Parquet predicate pushdown.
+        let (provider_scan, full_scan) = if !node.filters.is_empty() {
+            let scan_schema = registered.scan_provider.schema();
+            let vec_col_idx = scan_schema.index_of(&node.vector_col).ok();
+
+            // Pre-scan projection: all columns except vector.
+            let scalar_projection: Vec<usize> = (0..scan_schema.fields().len())
+                .filter(|&i| Some(i) != vec_col_idx)
+                .collect();
+
+            let pre_scan = registered
+                .scan_provider
+                .scan(session_state, Some(&scalar_projection), &node.filters, None)
+                .await?;
+
+            // Full scan: all columns (vector included for distance computation).
+            // Only created if the vector column exists in the scan provider.
+            let full = if vec_col_idx.is_some() {
+                Some(
+                    registered
+                        .scan_provider
+                        .scan(session_state, None, &node.filters, None)
+                        .await?,
+                )
+            } else {
+                None
+            };
+
+            (Some(pre_scan), full)
         } else {
-            None
+            (None, None)
         };
 
         Ok(Some(Arc::new(USearchExec::new(SearchParams {
@@ -166,6 +191,7 @@ impl ExtensionPlanner for USearchExecPlanner {
             vector_col: node.vector_col.clone(),
             brute_force_threshold: registered.config.brute_force_selectivity_threshold,
             provider_scan,
+            full_scan,
         }))))
     }
 }
@@ -186,8 +212,12 @@ struct SearchParams {
     scalar_kind: ScalarKind,
     vector_col: String,
     brute_force_threshold: f64,
-    /// Pre-planned provider scan for the filtered path (None for the unfiltered path).
+    /// Pre-planned provider scan for the filtered path (scalar + _key only, no vector col).
+    /// Used for selectivity estimation. None for the unfiltered path.
     provider_scan: Option<Arc<dyn ExecutionPlan>>,
+    /// Pre-planned full scan (all cols including vector) for the low-selectivity
+    /// Parquet-native path. None when unfiltered or when no vector column exists.
+    full_scan: Option<Arc<dyn ExecutionPlan>>,
 }
 
 // ── Physical execution node ───────────────────────────────────────────────────
@@ -234,20 +264,36 @@ impl ExecutionPlan for USearchExec {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
+        let mut children = Vec::new();
+        if let Some(ref scan) = self.params.provider_scan {
+            children.push(scan);
+        }
+        if let Some(ref full) = self.params.full_scan {
+            children.push(full);
+        }
+        children
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.is_empty() {
-            Ok(self)
-        } else {
-            Err(DataFusionError::Internal(
-                "USearchExec is a leaf node and takes no children".to_string(),
-            ))
+        let expected = self.children().len();
+        if children.len() != expected {
+            return Err(DataFusionError::Internal(format!(
+                "USearchExec: expected {expected} children, got {}",
+                children.len()
+            )));
         }
+        let mut params = self.params.clone();
+        let mut iter = children.into_iter();
+        if params.provider_scan.is_some() {
+            params.provider_scan = Some(iter.next().unwrap());
+        }
+        if params.full_scan.is_some() {
+            params.full_scan = Some(iter.next().unwrap());
+        }
+        Ok(Arc::new(USearchExec::new(params)))
     }
 
     fn execute(
@@ -352,29 +398,22 @@ async fn adaptive_filtered_execute(
     scan_plan: Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
 ) -> Result<Vec<RecordBatch>> {
-    let provider_schema = registered.scan_provider.schema();
-    // Key column index in scan_provider schema — used when reading scan batches.
-    let scan_key_col_idx = provider_schema.index_of(&registered.key_col).map_err(|_| {
+    // Key column index in the pre-scan output schema (projected, no vector col).
+    let pre_scan_schema = scan_plan.schema();
+    let scan_key_col_idx = pre_scan_schema.index_of(&registered.key_col).map_err(|_| {
         DataFusionError::Execution(format!(
-            "USearchExecPlanner: key column '{}' not found in scan provider schema",
+            "USearchExec: key column '{}' not found in pre-scan schema",
             registered.key_col
         ))
     })?;
-    // Key column index in lookup_provider schema — used by attach_distances.
+    // Key column index in lookup_provider schema — used by attach_distances (high-sel path).
     let lookup_key_col_idx = provider_key_col_idx(registered)?;
-    let vec_col_idx = provider_schema.index_of(&params.vector_col).ok();
-    let has_vec_col = vec_col_idx.is_some();
 
-    // Stream the provider scan batch-by-batch — O(1) memory for the scan phase.
+    // ── Phase 1: Pre-scan (scalar + _key only) for selectivity estimation ────
     let mut stream = scan_plan.execute(0, task_ctx.clone())?;
-
-    // Evaluate filters and collect valid rows (stream batch-by-batch, O(1) memory).
     let mut valid_keys: HashSet<u64> = HashSet::new();
-    // (key, distance) pairs — populated only when vec_col is available.
-    let mut key_distances: Vec<(u64, f32)> = Vec::new();
 
-    let scan_span =
-        tracing::info_span!("usearch_provider_scan", usearch.table = %params.table_name);
+    let scan_span = tracing::info_span!("usearch_pre_scan", usearch.table = %params.table_name);
     async {
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
@@ -386,21 +425,7 @@ async fn adaptive_filtered_execute(
                     && mask.value(row_idx)
                     && let Some(Some(key)) = keys.get(row_idx)
                 {
-                    let key = *key;
-                    valid_keys.insert(key);
-
-                    if let Some(vi) = vec_col_idx
-                        && let Ok(dist) = compute_distance_for_row(
-                            &batch,
-                            vi,
-                            row_idx,
-                            &params.query_vec,
-                            registered.scalar_kind,
-                            &params.distance_type,
-                        )
-                    {
-                        key_distances.push((key, dist));
-                    }
+                    valid_keys.insert(*key);
                 }
             }
         }
@@ -411,10 +436,6 @@ async fn adaptive_filtered_execute(
 
     // No rows pass the filter — return empty.
     if valid_keys.is_empty() {
-        tracing::debug!(
-            table = %params.table_name,
-            "usearch adaptive filter: 0 rows passed predicate, returning empty"
-        );
         tracing::Span::current().record("usearch.valid_rows", 0usize);
         tracing::Span::current().record("usearch.result_count", 0usize);
         return Ok(vec![]);
@@ -423,9 +444,10 @@ async fn adaptive_filtered_execute(
     let total = registered.index.size();
     let selectivity = valid_keys.len() as f64 / total.max(1) as f64;
     let threshold = params.brute_force_threshold;
+    let has_full_scan = params.full_scan.is_some();
 
-    let path = if selectivity <= threshold && has_vec_col && !key_distances.is_empty() {
-        "brute-force"
+    let path = if selectivity <= threshold && has_full_scan {
+        "parquet-native"
     } else {
         "filtered_search"
     };
@@ -433,44 +455,15 @@ async fn adaptive_filtered_execute(
     tracing::Span::current().record("usearch.total_rows", total);
     tracing::Span::current().record("usearch.selectivity", selectivity);
     tracing::Span::current().record("usearch.path", path);
-    tracing::debug!(
-        table = %params.table_name,
-        k = params.k,
-        valid_rows = valid_keys.len(),
-        total_rows = total,
-        selectivity = format!("{:.4}", selectivity),
-        threshold,
-        has_vec_col,
-        "usearch adaptive filter: {} path (selectivity={:.4}, threshold={})",
-        path, selectivity, threshold,
-    );
 
-    if selectivity <= threshold && has_vec_col && !key_distances.is_empty() {
-        // ── Brute-force path: exact distances over the valid subset ───────
-        let top_k = heap_select_top_k(&mut key_distances, params.k);
-
-        let key_to_dist: HashMap<u64, f32> = top_k.iter().cloned().collect();
-        let top_keys: Vec<u64> = top_k.iter().map(|(k, _)| *k).collect();
-
-        let data_batches = registered
-            .lookup_provider
-            .fetch_by_keys(&top_keys, &params.key_col, None)
-            .await?;
-
-        let result_batches = attach_distances(
-            data_batches,
-            lookup_key_col_idx,
-            &key_to_dist,
-            &params.schema,
-        )?;
-
-        tracing::Span::current().record(
-            "usearch.result_count",
-            result_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
-        );
-        Ok(result_batches)
+    if selectivity <= threshold && has_full_scan {
+        // ── Low-selectivity: Parquet-native path (no USearch, no SQLite) ──
+        // Second scan reads all columns including vector. Compute distances
+        // inline, maintain top-k heap, build result directly from scan data.
+        let full_scan = params.full_scan.clone().unwrap();
+        parquet_native_execute(params, registered, full_scan, task_ctx).await
     } else {
-        // ── filtered_search path: in-graph predicate ──────────────────────
+        // ── High-selectivity: HNSW filtered_search + SQLite fetch ─────────
         let matches = tracing::info_span!(
             "usearch_hnsw_filtered_search",
             usearch.table = %params.table_name
@@ -514,6 +507,164 @@ async fn adaptive_filtered_execute(
             result_batches.iter().map(|b| b.num_rows()).sum::<usize>(),
         );
         Ok(result_batches)
+    }
+}
+
+// ── Parquet-native low-selectivity execution ──────────────────────────────────
+
+/// Execute the low-selectivity path entirely from Parquet — no USearch, no SQLite.
+///
+/// Streams the full scan (all columns including vector), evaluates WHERE filters,
+/// computes distances for passing rows, maintains a top-k heap, and builds the
+/// result directly from scan data.
+#[tracing::instrument(
+    name = "usearch_parquet_native",
+    skip_all,
+    fields(usearch.table = %params.table_name)
+)]
+async fn parquet_native_execute(
+    params: &SearchParams,
+    registered: &crate::registry::RegisteredTable,
+    full_scan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+) -> Result<Vec<RecordBatch>> {
+    let full_schema = full_scan.schema();
+    let vec_col_idx = full_schema.index_of(&params.vector_col).map_err(|_| {
+        DataFusionError::Execution(format!(
+            "USearchExec: vector column '{}' not found in full scan schema",
+            params.vector_col
+        ))
+    })?;
+
+    // Map each lookup_provider field to its index in the full scan schema by name.
+    // This avoids silent column mismatches if the two schemas have different orderings.
+    let lookup_schema = registered.lookup_provider.schema();
+    let output_col_indices: Vec<usize> = lookup_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            full_schema.index_of(f.name()).map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "USearchExec: column '{}' from lookup schema not found in full scan schema",
+                    f.name()
+                ))
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    // Top-k heap: stores (distance, projected_row_slice).
+    // At low selectivity (<=5%), the number of passing rows is small.
+    let mut heap: BinaryHeap<ScoredRow> = BinaryHeap::with_capacity(params.k + 1);
+
+    let mut stream = full_scan.execute(0, task_ctx)?;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result?;
+        let mask = evaluate_filters(&params.physical_filters, &batch)?;
+
+        for row_idx in 0..batch.num_rows() {
+            if mask.is_null(row_idx) || !mask.value(row_idx) {
+                continue;
+            }
+
+            let dist = match compute_distance_for_row(
+                &batch,
+                vec_col_idx,
+                row_idx,
+                &params.query_vec,
+                registered.scalar_kind,
+                &params.distance_type,
+            ) {
+                Ok(d) if !d.is_nan() => d,
+                _ => continue, // skip null vectors and NaN distances
+            };
+
+            // Project the row to output columns (drop vector col), zero-copy slice.
+            let row_cols: Vec<Arc<dyn Array>> = output_col_indices
+                .iter()
+                .map(|&i| batch.column(i).slice(row_idx, 1))
+                .collect();
+
+            heap.push(ScoredRow {
+                distance: dist,
+                row: row_cols,
+            });
+            if heap.len() > params.k {
+                heap.pop(); // evict farthest
+            }
+        }
+    }
+
+    if heap.is_empty() {
+        tracing::Span::current().record("usearch.result_count", 0usize);
+        return Ok(vec![]);
+    }
+
+    // Build result: sort by distance ascending, concat into batches.
+    let mut entries: Vec<ScoredRow> = heap.into_vec();
+    entries.sort_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let n = entries.len();
+    let mut result_cols: Vec<Vec<Arc<dyn Array>>> =
+        vec![Vec::with_capacity(n); output_col_indices.len()];
+    let mut distances: Vec<f32> = Vec::with_capacity(n);
+
+    for entry in &entries {
+        for (col_idx, col_slice) in entry.row.iter().enumerate() {
+            result_cols[col_idx].push(col_slice.clone());
+        }
+        distances.push(entry.distance);
+    }
+
+    // Concatenate per-column arrays.
+    let concat_cols: Vec<Arc<dyn Array>> = result_cols
+        .into_iter()
+        .map(|slices| {
+            let refs: Vec<&dyn Array> = slices.iter().map(|a| a.as_ref()).collect();
+            datafusion::arrow::compute::concat(&refs)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        })
+        .collect::<Result<_>>()?;
+
+    // Append _distance column.
+    let mut all_cols = concat_cols;
+    all_cols.push(Arc::new(Float32Array::from(distances)));
+
+    let result_batch = RecordBatch::try_new(params.schema.clone(), all_cols)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+    tracing::Span::current().record("usearch.result_count", result_batch.num_rows());
+    Ok(vec![result_batch])
+}
+
+/// A row with its computed distance, for the top-k heap.
+/// The max-heap evicts the *farthest* row when it exceeds k.
+struct ScoredRow {
+    distance: f32,
+    /// Column arrays (one per output column), each a single-row slice.
+    row: Vec<Arc<dyn Array>>,
+}
+
+impl PartialEq for ScoredRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance == other.distance
+    }
+}
+impl Eq for ScoredRow {}
+impl PartialOrd for ScoredRow {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ScoredRow {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Max-heap: largest distance at top → gets evicted first.
+        self.distance
+            .partial_cmp(&other.distance)
+            .unwrap_or(std::cmp::Ordering::Less)
     }
 }
 
@@ -699,50 +850,6 @@ fn compute_distance_for_row(
             Ok(dist)
         }
     }
-}
-
-/// Select the k smallest-distance (key, dist) pairs from `pairs` using a
-/// max-heap of size k.  Returns pairs sorted ascending by distance.
-///
-/// `pairs` is consumed (sorted in place) to avoid an extra allocation.
-fn heap_select_top_k(pairs: &mut [(u64, f32)], k: usize) -> Vec<(u64, f32)> {
-    if pairs.len() <= k {
-        pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        return pairs.to_owned();
-    }
-
-    // Max-heap: store (OrderedFloat, key).  Pop the largest when size > k.
-    // We negate the float to turn BinaryHeap (max-heap) into a min-by-distance
-    // structure: the root is always the *farthest* current candidate.
-    #[derive(PartialEq)]
-    struct HeapEntry(f32, u64);
-
-    impl Eq for HeapEntry {}
-    impl PartialOrd for HeapEntry {
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-    impl Ord for HeapEntry {
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            // NaN sorts to the top of the heap so it gets evicted first.
-            self.0
-                .partial_cmp(&other.0)
-                .unwrap_or(std::cmp::Ordering::Less)
-        }
-    }
-
-    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(k + 1);
-    for &(key, dist) in pairs.iter() {
-        heap.push(HeapEntry(dist, key));
-        if heap.len() > k {
-            heap.pop(); // evict the farthest
-        }
-    }
-
-    let mut result: Vec<(u64, f32)> = heap.into_iter().map(|e| (e.1, e.0)).collect();
-    result.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    result
 }
 
 /// Index of the key column in the lookup provider schema.
