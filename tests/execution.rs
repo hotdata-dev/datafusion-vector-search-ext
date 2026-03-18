@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
-use arrow_array::{FixedSizeListArray, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
@@ -452,4 +452,61 @@ async fn exec_parquet_native_where_no_matches() {
     );
     let ids = collect_ids(&ctx, &sql).await;
     assert!(ids.is_empty(), "no rows should match; got {ids:?}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Numeric regression — l2_distance must return L2sq (no sqrt)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// l2_distance must return squared L2, not actual L2.
+/// Row 1 = [1,0,0,0], query = [1,0,0,0] → L2sq = 0.0
+/// Row 2 = [0,1,0,0], query = [1,0,0,0] → L2sq = 2.0 (L2 would be ~1.414)
+#[tokio::test]
+async fn exec_l2_distance_returns_l2sq() {
+    let ctx = make_exec_ctx("items::vector").await;
+    let sql =
+        format!("SELECT id, l2_distance(vector, {Q}) AS dist FROM items ORDER BY dist ASC LIMIT 4");
+    let df = ctx.sql(&sql).await.expect("sql");
+    let batches = df.collect().await.expect("collect");
+
+    let mut dists: Vec<(u64, f32)> = vec![];
+    for batch in &batches {
+        let id_idx = batch.schema().index_of("id").unwrap();
+        let dist_idx = batch.schema().index_of("dist").unwrap();
+        let ids = batch
+            .column(id_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let ds = batch
+            .column(dist_idx)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            dists.push((ids.value(i), ds.value(i)));
+        }
+    }
+
+    // Row 1: exact match → 0.0
+    let row1 = dists
+        .iter()
+        .find(|(id, _)| *id == 1)
+        .expect("row 1 missing");
+    assert!(
+        (row1.1 - 0.0).abs() < 1e-6,
+        "row 1 distance must be 0.0 (L2sq); got {}",
+        row1.1
+    );
+
+    // Row 2: [0,1,0,0] vs [1,0,0,0] → L2sq = 2.0, NOT sqrt(2) ≈ 1.414
+    let row2 = dists
+        .iter()
+        .find(|(id, _)| *id == 2)
+        .expect("row 2 missing");
+    assert!(
+        (row2.1 - 2.0).abs() < 1e-6,
+        "row 2 distance must be 2.0 (L2sq), not {:.4} (would be ~1.414 if L2)",
+        row2.1
+    );
 }

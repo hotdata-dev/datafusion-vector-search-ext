@@ -93,7 +93,7 @@ use datafusion::prelude::SessionContext;
 /// Register all extension components with a DataFusion [`SessionContext`].
 ///
 /// Registers:
-/// - `l2_distance(col, query)`          — Euclidean distance (L2)
+/// - `l2_distance(col, query)`          — squared Euclidean distance (L2sq)
 /// - `cosine_distance(col, query)`      — cosine distance
 /// - `negative_dot_product(col, query)` — negated inner product
 /// - `vector_usearch(table, query, k)`  — explicit ANN table function
