@@ -261,20 +261,36 @@ impl ExecutionPlan for USearchExec {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
+        let mut children = Vec::new();
+        if let Some(ref scan) = self.params.provider_scan {
+            children.push(scan);
+        }
+        if let Some(ref full) = self.params.full_scan {
+            children.push(full);
+        }
+        children
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.is_empty() {
-            Ok(self)
-        } else {
-            Err(DataFusionError::Internal(
-                "USearchExec is a leaf node and takes no children".to_string(),
-            ))
+        let expected = self.children().len();
+        if children.len() != expected {
+            return Err(DataFusionError::Internal(format!(
+                "USearchExec: expected {expected} children, got {}",
+                children.len()
+            )));
         }
+        let mut params = self.params.clone();
+        let mut iter = children.into_iter();
+        if params.provider_scan.is_some() {
+            params.provider_scan = Some(iter.next().unwrap());
+        }
+        if params.full_scan.is_some() {
+            params.full_scan = Some(iter.next().unwrap());
+        }
+        Ok(Arc::new(USearchExec::new(params)))
     }
 
     fn execute(
