@@ -204,3 +204,78 @@ async fn test_table_name_with_spaces() {
     let batches = provider.fetch_by_keys(&[0], "row_idx", None).await.unwrap();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 }
+
+/// Verify that a non-default key column name (e.g. "_key") works correctly.
+/// This is the scenario used by runtimedb where Parquet files have a `_key` column.
+#[tokio::test]
+async fn test_custom_key_column_name() {
+    let dir = tempdir().unwrap();
+
+    let parquet_schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+
+    // Provider schema uses "_key" instead of the default "row_idx".
+    let provider_schema = Arc::new(Schema::new(vec![
+        Field::new("_key", DataType::UInt64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        parquet_schema.clone(),
+        vec![Arc::new(StringArray::from(vec![
+            Some("alice"),
+            Some("bob"),
+            Some("carol"),
+        ]))],
+    )
+    .unwrap();
+
+    let parquet_path = dir.path().join("test.parquet");
+    let file = std::fs::File::create(&parquet_path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, parquet_schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let db_path = dir.path().join("test_key.db");
+    let provider = SqliteLookupProvider::open_or_build(
+        db_path.to_str().unwrap(),
+        "vectors",
+        2,
+        &[parquet_path.to_str().unwrap().to_string()],
+        provider_schema,
+        &[0],
+    )
+    .unwrap();
+
+    // fetch_by_keys should work with the custom key column
+    let batches = provider.fetch_by_keys(&[0, 2], "_key", None).await.unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+
+    let names: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|v| v.unwrap().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(names, vec!["alice", "carol"]);
+
+    // projection to only the key column should also work
+    let batches = provider
+        .fetch_by_keys(&[1], "_key", Some(&[0]))
+        .await
+        .unwrap();
+    assert_eq!(batches[0].schema().field(0).name(), "_key");
+    let key_col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(key_col.value(0), 1);
+}
