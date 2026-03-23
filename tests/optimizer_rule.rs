@@ -419,3 +419,52 @@ async fn test_qualified_ref_where_clause_rewrites() {
         "qualified ref + WHERE → filter absorbed, rule must fire\nPlan: {plan:?}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SELECT only distance — no base columns projected
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// When the SELECT list contains only the distance UDF (no base table columns),
+// the Projection node has a single computed expression. The optimizer must still
+// recognise the pattern and rewrite to USearchNode.
+
+/// Bare table, SELECT only distance alias, ORDER BY alias — rule must fire.
+#[tokio::test]
+async fn test_select_only_distance_bare_rewrites() {
+    let ctx = make_ctx(MetricKind::L2sq).await;
+    let sql =
+        format!("SELECT l2_distance(vector, {Q}) AS dist FROM items ORDER BY dist ASC LIMIT 5");
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        contains_usearch_node(&plan),
+        "SELECT only distance (bare) → rule must fire\nPlan: {plan:?}"
+    );
+}
+
+/// Qualified table, SELECT only distance alias, ORDER BY alias — rule must fire.
+#[tokio::test]
+async fn test_select_only_distance_qualified_rewrites() {
+    let ctx = make_ctx_qualified(MetricKind::L2sq).await;
+    let sql = format!(
+        "SELECT l2_distance(vector, {Q}) AS dist FROM datafusion.public.items ORDER BY dist ASC LIMIT 5"
+    );
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        contains_usearch_node(&plan),
+        "SELECT only distance (qualified) → rule must fire\nPlan: {plan:?}"
+    );
+}
+
+/// Bare table, SELECT only distance (no alias), ORDER BY the UDF directly.
+#[tokio::test]
+async fn test_select_only_distance_no_alias_rewrites() {
+    let ctx = make_ctx(MetricKind::L2sq).await;
+    let sql = format!(
+        "SELECT l2_distance(vector, {Q}) FROM items ORDER BY l2_distance(vector, {Q}) ASC LIMIT 5"
+    );
+    let plan = optimized_plan(&ctx, &sql).await;
+    assert!(
+        contains_usearch_node(&plan),
+        "SELECT only distance (no alias, ORDER BY UDF) → rule must fire\nPlan: {plan:?}"
+    );
+}
