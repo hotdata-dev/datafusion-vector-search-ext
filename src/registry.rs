@@ -87,7 +87,7 @@ impl USearchIndexConfig {
             .map_err(|e| DataFusionError::Execution(format!("USearch Index::new failed: {e}")))
     }
 
-    /// Load a previously saved index from `path`.
+    /// Load a previously saved index from `path` into memory.
     ///
     /// Uses the same `IndexOptions` as `build_index()`.  The options must
     /// match those used when the index was originally built — passing wrong
@@ -98,6 +98,26 @@ impl USearchIndexConfig {
         index
             .load(path)
             .map_err(|e| DataFusionError::Execution(format!("USearch index load failed: {e}")))?;
+        Ok(index)
+    }
+
+    /// Memory-map a previously saved index from `path`.
+    ///
+    /// Unlike [`load_index`], this does not copy the index into RAM. The OS
+    /// pages data in on demand, keeping resident memory proportional to the
+    /// working set rather than the full index size. Prefer this for the
+    /// reload-from-disk path where the index file is already local.
+    ///
+    /// The returned [`Index`] is fully functional for search; the backing
+    /// file must remain on disk for the lifetime of the index.
+    ///
+    /// [`load_index`]: Self::load_index
+    pub fn view_index(&self, path: &str) -> Result<Index> {
+        let index = Index::new(&self.to_index_options())
+            .map_err(|e| DataFusionError::Execution(format!("USearch Index::new failed: {e}")))?;
+        index
+            .view(path)
+            .map_err(|e| DataFusionError::Execution(format!("USearch index view failed: {e}")))?;
         Ok(index)
     }
 
