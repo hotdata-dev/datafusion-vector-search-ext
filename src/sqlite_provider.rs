@@ -252,6 +252,12 @@ impl SqliteLookupProvider {
             )?;
         }
 
+        // Checkpoint WAL so the data is flushed to the main database file.
+        // Without this, data written during build may only exist in the WAL
+        // and can be lost if the process exits before a passive checkpoint.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| DataFusionError::Execution(format!("WAL checkpoint failed: {e}")))?;
+
         let mut conns = vec![conn];
         for _ in 1..pool_size {
             conns.push(open_conn(db_path)?);
