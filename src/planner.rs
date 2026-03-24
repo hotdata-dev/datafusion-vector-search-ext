@@ -58,9 +58,27 @@ use usearch::ScalarKind;
 
 use tracing::Instrument;
 
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::logical_expr::Expr;
+
 use crate::lookup::extract_keys_as_u64;
 use crate::node::{DistanceType, USearchNode};
 use crate::registry::USearchRegistry;
+
+/// Strip table qualifiers from column references so expressions can be
+/// resolved against an unqualified Arrow schema.  Mirrors the pattern in
+/// DataFusion's own `physical_planner.rs::strip_column_qualifiers`.
+fn strip_column_qualifier(expr: &Expr) -> Expr {
+    match expr.clone().transform(|e| match &e {
+        Expr::Column(col) if col.relation.is_some() => Ok(Transformed::yes(Expr::Column(
+            datafusion::common::Column::new_unqualified(col.name.clone()),
+        ))),
+        _ => Ok(Transformed::no(e)),
+    }) {
+        Ok(t) => t.data,
+        Err(_) => expr.clone(),
+    }
+}
 
 // ── QueryPlanner wrapper ──────────────────────────────────────────────────────
 
@@ -143,22 +161,49 @@ impl ExtensionPlanner for USearchExecPlanner {
             .collect::<Result<_>>()?;
 
         // For the filtered path, pre-plan two provider scans:
-        // 1. Pre-scan (scalar + _key only, no vector col) — cheap selectivity estimation.
+        // 1. Pre-scan (_key + filter cols only) — cheap selectivity estimation.
         // 2. Full scan (all cols including vector) — only executed at runtime if low-sel.
         // Both scans receive the node's WHERE filters for Parquet predicate pushdown.
-        let (provider_scan, full_scan) = if !node.filters.is_empty() {
+        let (provider_scan, full_scan, prescan_filters) = if !node.filters.is_empty() {
             let scan_schema = registered.scan_provider.schema();
             let vec_col_idx = scan_schema.index_of(&node.vector_col).ok();
 
-            // Pre-scan projection: all columns except vector.
+            // Pre-scan projection: _key + columns referenced by filters.
+            // Only these are needed — _key to collect valid keys, and filter
+            // columns for predicate evaluation. Reading anything else wastes I/O.
+            let filter_col_names: HashSet<&str> = node
+                .filters
+                .iter()
+                .flat_map(|f| f.column_refs())
+                .map(|c| c.name.as_str())
+                .collect();
+            let key_col_idx = scan_schema.index_of(&registered.key_col).ok();
             let scalar_projection: Vec<usize> = (0..scan_schema.fields().len())
-                .filter(|&i| Some(i) != vec_col_idx)
+                .filter(|&i| {
+                    Some(i) == key_col_idx
+                        || filter_col_names.contains(scan_schema.field(i).name().as_str())
+                })
                 .collect();
 
             let pre_scan = registered
                 .scan_provider
                 .scan(session_state, Some(&scalar_projection), &node.filters, None)
                 .await?;
+
+            // Compile physical filters against the pre-scan's projected schema
+            // so column indices match the narrower batch layout.
+            let pre_scan_schema = pre_scan.schema();
+            let pre_scan_df_schema =
+                datafusion::common::DFSchema::try_from(pre_scan_schema.as_ref().clone())?;
+            let prescan_physical_filters: Vec<Arc<dyn PhysicalExpr>> = node
+                .filters
+                .iter()
+                .map(|f| {
+                    // Strip table qualifiers — the projected schema is unqualified.
+                    let unqualified = strip_column_qualifier(f);
+                    create_physical_expr(&unqualified, &pre_scan_df_schema, exec_props)
+                })
+                .collect::<Result<_>>()?;
 
             // Full scan: all columns (vector included for distance computation).
             // Only created if the vector column exists in the scan provider.
@@ -173,9 +218,9 @@ impl ExtensionPlanner for USearchExecPlanner {
                 None
             };
 
-            (Some(pre_scan), full)
+            (Some(pre_scan), full, prescan_physical_filters)
         } else {
-            (None, None)
+            (None, None, vec![])
         };
 
         Ok(Some(Arc::new(USearchExec::new(SearchParams {
@@ -185,6 +230,7 @@ impl ExtensionPlanner for USearchExecPlanner {
             k: node.k,
             distance_type: node.distance_type.clone(),
             physical_filters,
+            prescan_filters,
             schema: registered.schema.clone(),
             key_col: registered.key_col.clone(),
             scalar_kind: registered.scalar_kind,
@@ -207,6 +253,10 @@ struct SearchParams {
     k: usize,
     distance_type: DistanceType,
     physical_filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// Physical filters compiled against the pre-scan's projected schema.
+    /// Column indices match the narrow _key + filter-col projection, not the
+    /// full table schema. Used by adaptive_filtered_execute for pre-scan evaluation.
+    prescan_filters: Vec<Arc<dyn PhysicalExpr>>,
     schema: SchemaRef,
     key_col: String,
     scalar_kind: ScalarKind,
@@ -434,7 +484,7 @@ async fn adaptive_filtered_execute(
     async {
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
-            let mask = evaluate_filters(&params.physical_filters, &batch)?;
+            let mask = evaluate_filters(&params.prescan_filters, &batch)?;
             let keys = extract_keys_as_u64(batch.column(scan_key_col_idx).as_ref())?;
 
             for row_idx in 0..batch.num_rows() {
