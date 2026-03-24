@@ -46,7 +46,7 @@ let index = cfg.load_index("my_table.index")?;
 
 Registration requires two providers:
 
-- **`scan_provider`** (`Arc<dyn TableProvider>`) — used for WHERE evaluation and the low-selectivity Parquet-native path. Should contain all columns including the vector column.
+- **`scan_provider`** (`Arc<dyn TableProvider>`) — used for WHERE evaluation during the pre-scan phase (scalar columns only).
 - **`lookup_provider`** (`Arc<dyn PointLookupProvider>`) — used for O(k) key-based row fetch after HNSW search. Does not need the vector column.
 
 `PointLookupProvider` extends DataFusion's `TableProvider` with a single method:
@@ -211,7 +211,7 @@ src/
 
 tests/
   optimizer_rule.rs  — rewrite rule matching/rejection tests
-  execution.rs       — end-to-end execution tests (HNSW + Parquet-native paths)
+  execution.rs       — end-to-end execution tests (HNSW + index-get paths)
 ```
 
 ### Optimizer rewrite
@@ -245,22 +245,21 @@ Query arrives
   |
   +-- Has WHERE clause
         |
-        +-- Pre-scan: scan_provider (scalar + _key cols only, filter pushdown)
+        +-- Pre-scan: scan_provider (_key + filter cols only, predicate pushdown)
         |     -> collect valid_keys, compute selectivity
         |
         +-- Low selectivity (<= threshold, default 5%)
-        |     -> Full scan from scan_provider (all cols including vector)
-        |     -> evaluate WHERE, compute distances, top-k heap
-        |     -> return directly -- NO USearch, NO lookup_provider
+        |     -> index.get(key) for each valid_key -> compute distances -> top-k
+        |     -> lookup_provider fetch(k) -> result
         |
         +-- High selectivity (> threshold)
               -> HNSW filtered_search(valid_keys predicate)
               -> lookup_provider fetch(k) -> result
 ```
 
-**Pre-scan phase:** Projects only scalar columns and the key column (excludes the vector column for efficiency). Filter expressions are pushed down to the scan provider. Collects the set of valid keys and computes `selectivity = valid_keys.len() / index.size()`.
+**Pre-scan phase:** Projects only `_key` and columns referenced by the WHERE clause (excludes all other columns for efficiency). Filter expressions are pushed down to the scan provider for Parquet-level pruning (row group statistics, bloom filters, page indexes). Collects the set of valid keys and computes `selectivity = valid_keys.len() / index.size()`.
 
-**Low-selectivity path (Parquet-native):** When few rows pass the filter, HNSW graph traversal becomes expensive (it must explore ~`k/selectivity` nodes to find k passing candidates). Instead, the full scan streams all columns including the vector, evaluates filters per batch, computes exact distances for passing rows, and maintains a top-k heap (`ScoredRow`). Returns results directly without touching USearch or the lookup provider.
+**Low-selectivity path (index-get):** When few rows pass the filter, HNSW graph traversal becomes expensive (it must explore ~`k/selectivity` nodes to find k passing candidates). Instead, vectors are retrieved directly from the USearch index via `index.get(key)` for each valid key, exact distances are computed, and a top-k heap selects the closest matches. Result rows are fetched from the lookup provider.
 
 **High-selectivity path (HNSW filtered):** Passes valid keys as a predicate to `index.filtered_search()` — HNSW skips non-passing nodes during traversal. Result keys are fetched from the lookup provider.
 
@@ -284,7 +283,7 @@ All three distance functions are **lower-is-closer**:
 cargo test
 ```
 
-Tests cover optimizer rule matching/rejection, end-to-end execution through both HNSW and Parquet-native paths, registration validation, and provider error handling.
+Tests cover optimizer rule matching/rejection, end-to-end execution through both HNSW and index-get paths, registration validation, and provider error handling.
 
 ---
 
