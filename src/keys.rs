@@ -92,13 +92,22 @@ impl DatasetLayout {
 
         let mut running_total = 0u64;
         for &path in local_paths {
-            let file_name = Path::new(path)
+            // Prevent path traversal attacks by rejecting paths containing '..'.
+            let p = Path::new(path);
+            if p.components().any(|c| c == std::path::Component::ParentDir) {
+                return Err(DataFusionError::Execution(format!(
+                    "Invalid input: {}",
+                    p.display()
+                )));
+            }
+
+            let file_name = p
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| DataFusionError::Execution(format!("invalid path: {path}")))?;
             file_keys.push(format!("{key_prefix}{file_name}"));
 
-            let f = fs::File::open(path)
+            let f = fs::File::open(p)
                 .map_err(|e| DataFusionError::Execution(format!("open {path}: {e}")))?;
             let builder = ParquetRecordBatchReaderBuilder::try_new(f)
                 .map_err(|e| DataFusionError::Execution(format!("read footer {path}: {e}")))?;
