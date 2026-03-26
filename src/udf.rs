@@ -139,14 +139,23 @@ fn inner_to_f32(inner: &dyn Array, udf_name: &str) -> Result<Vec<f32>> {
 ///
 /// Supports all outer array types (FixedSizeList, List, LargeList) and
 /// inner element types (Float32, Float64 — Float64 is cast to f32 for the kernel).
+///
+/// Returns an error if vector dimensions do not match the query length.
 fn compute_distances(
     vec_col: &dyn Array,
     query_vec: &[f32],
     kernel: Kernel,
     udf_name: &str,
 ) -> Result<Vec<Option<f32>>> {
-    // FixedSizeListArray — typical for DuckDB FLOAT[N] or pre-cast columns
+    // FixedSizeListArray — dimension known from type, validate once upfront.
     if let Some(fsl) = vec_col.as_any().downcast_ref::<FixedSizeListArray>() {
+        let col_dim = fsl.value_length() as usize;
+        if col_dim != query_vec.len() {
+            return Err(DataFusionError::Execution(format!(
+                "{udf_name}: query vector length ({}) must match column dimensionality ({col_dim})",
+                query_vec.len(),
+            )));
+        }
         let mut out = Vec::with_capacity(fsl.len());
         for i in 0..fsl.len() {
             if fsl.is_null(i) {
@@ -159,7 +168,7 @@ fn compute_distances(
         return Ok(out);
     }
 
-    // ListArray — variable-length, e.g. PostgreSQL real[] / float8[]
+    // ListArray — variable-length, validate per row.
     if let Some(lst) = vec_col.as_any().downcast_ref::<ListArray>() {
         let mut out = Vec::with_capacity(lst.len());
         for i in 0..lst.len() {
@@ -168,12 +177,19 @@ fn compute_distances(
                 continue;
             }
             let f32s = inner_to_f32(&*lst.value(i), udf_name)?;
+            if f32s.len() != query_vec.len() {
+                return Err(DataFusionError::Execution(format!(
+                    "{udf_name}: query vector length ({}) must match row {i} dimensionality ({})",
+                    query_vec.len(),
+                    f32s.len(),
+                )));
+            }
             out.push(Some(kernel(&f32s, query_vec)));
         }
         return Ok(out);
     }
 
-    // LargeListArray — large-offset variant, e.g. some Postgres/Parquet encodings
+    // LargeListArray — large-offset variant, validate per row.
     if let Some(lst) = vec_col.as_any().downcast_ref::<LargeListArray>() {
         let mut out = Vec::with_capacity(lst.len());
         for i in 0..lst.len() {
@@ -182,6 +198,13 @@ fn compute_distances(
                 continue;
             }
             let f32s = inner_to_f32(&*lst.value(i), udf_name)?;
+            if f32s.len() != query_vec.len() {
+                return Err(DataFusionError::Execution(format!(
+                    "{udf_name}: query vector length ({}) must match row {i} dimensionality ({})",
+                    query_vec.len(),
+                    f32s.len(),
+                )));
+            }
             out.push(Some(kernel(&f32s, query_vec)));
         }
         return Ok(out);
