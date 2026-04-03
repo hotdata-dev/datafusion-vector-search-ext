@@ -214,6 +214,23 @@ pub struct RegisteredTable {
     pub config: USearchTableConfig,
 }
 
+// ── VectorIndexResolver ───────────────────────────────────────────────────────
+
+/// Trait for resolving vector index entries by name.
+///
+/// The optimizer rule, physical planner, and executor all call `resolve()` to
+/// obtain the loaded index, providers, and metadata needed for ANN execution.
+///
+/// The built-in [`USearchRegistry`] implements this as a direct hashmap lookup.
+/// Production systems can implement a catalog-backed resolver that treats the
+/// in-memory index as a cache and reloads from storage on miss or staleness.
+pub trait VectorIndexResolver: Send + Sync + std::fmt::Debug {
+    /// Look up a registered table by its key (e.g., `"catalog::schema::table::col"`).
+    ///
+    /// Returns `None` if the key is not found or the index is not available.
+    fn resolve(&self, name: &str) -> Option<Arc<RegisteredTable>>;
+}
+
 // ── USearchRegistry ───────────────────────────────────────────────────────────
 
 pub struct USearchRegistry {
@@ -372,6 +389,17 @@ impl USearchRegistry {
 
     pub fn into_arc(self) -> Arc<Self> {
         Arc::new(self)
+    }
+
+    /// Convert into a trait object for use with the optimizer rule and planner.
+    pub fn into_resolver(self) -> Arc<dyn VectorIndexResolver> {
+        Arc::new(self)
+    }
+}
+
+impl VectorIndexResolver for USearchRegistry {
+    fn resolve(&self, name: &str) -> Option<Arc<RegisteredTable>> {
+        self.get(name)
     }
 }
 

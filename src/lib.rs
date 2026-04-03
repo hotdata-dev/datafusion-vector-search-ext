@@ -74,7 +74,10 @@ pub use keys::{DatasetLayout, pack_key, unpack_key};
 pub use lookup::{HashKeyProvider, PointLookupProvider};
 pub use node::{DistanceType, USearchNode};
 pub use planner::{USearchExec, USearchExecPlanner, USearchQueryPlanner};
-pub use registry::{RegisteredTable, USearchIndexConfig, USearchRegistry, USearchTableConfig};
+pub use registry::{
+    RegisteredTable, USearchIndexConfig, USearchRegistry, USearchTableConfig,
+    VectorIndexResolver,
+};
 pub use rule::USearchRule;
 pub use udf::{cosine_distance_udf, l2_distance_udf, negative_dot_product_udf};
 pub use udtf::USearchUDTF;
@@ -101,7 +104,7 @@ use datafusion::prelude::SessionContext;
 ///
 /// The [`USearchQueryPlanner`] must be installed at `SessionState` build time
 /// (before this call) via `SessionStateBuilder::with_query_planner`.
-pub fn register_all(ctx: &SessionContext, registry: Arc<USearchRegistry>) -> Result<()> {
+pub fn register_all(ctx: &SessionContext, registry: Arc<dyn VectorIndexResolver>) -> Result<()> {
     ctx.register_udf(ScalarUDF::new_from_impl(l2_distance_udf()));
     ctx.register_udf(ScalarUDF::new_from_impl(cosine_distance_udf()));
     ctx.register_udf(ScalarUDF::new_from_impl(negative_dot_product_udf()));

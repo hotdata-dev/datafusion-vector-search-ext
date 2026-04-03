@@ -62,7 +62,7 @@ use datafusion::logical_expr::Expr;
 
 use crate::lookup::extract_keys_as_u64;
 use crate::node::{DistanceType, USearchNode};
-use crate::registry::USearchRegistry;
+use crate::registry::VectorIndexResolver;
 
 /// Strip table qualifiers from column references so expressions can be
 /// resolved against an unqualified Arrow schema.  Mirrors the pattern in
@@ -92,7 +92,7 @@ impl fmt::Debug for USearchQueryPlanner {
 }
 
 impl USearchQueryPlanner {
-    pub fn new(registry: Arc<USearchRegistry>) -> Self {
+    pub fn new(registry: Arc<dyn VectorIndexResolver>) -> Self {
         let inner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
             USearchExecPlanner::new(registry),
         )]);
@@ -116,11 +116,11 @@ impl QueryPlanner for USearchQueryPlanner {
 // ── Extension planner ─────────────────────────────────────────────────────────
 
 pub struct USearchExecPlanner {
-    registry: Arc<USearchRegistry>,
+    registry: Arc<dyn VectorIndexResolver>,
 }
 
 impl USearchExecPlanner {
-    pub fn new(registry: Arc<USearchRegistry>) -> Self {
+    pub fn new(registry: Arc<dyn VectorIndexResolver>) -> Self {
         Self { registry }
     }
 }
@@ -141,7 +141,7 @@ impl ExtensionPlanner for USearchExecPlanner {
         };
 
         // Cheap validation: RwLock read + HashMap lookup — no I/O.
-        let registered = match self.registry.get(&node.table_name) {
+        let registered = match self.registry.resolve(&node.table_name) {
             Some(r) => r,
             None => {
                 return Err(DataFusionError::Execution(format!(
@@ -243,7 +243,7 @@ impl ExtensionPlanner for USearchExecPlanner {
 #[derive(Debug, Clone)]
 struct SearchParams {
     table_name: String,
-    registry: Arc<USearchRegistry>,
+    registry: Arc<dyn VectorIndexResolver>,
     query_vec: Vec<f64>,
     k: usize,
     distance_type: DistanceType,
@@ -360,7 +360,7 @@ async fn usearch_execute(
     task_ctx: Arc<TaskContext>,
 ) -> Result<Vec<RecordBatch>> {
     // Re-fetch at execute time so cache eviction between plan and execute is handled correctly.
-    let registered = params.registry.get(&params.table_name).ok_or_else(|| {
+    let registered = params.registry.resolve(&params.table_name).ok_or_else(|| {
         DataFusionError::Execution(format!(
             "USearchExec: table '{}' not in registry at execute time",
             params.table_name

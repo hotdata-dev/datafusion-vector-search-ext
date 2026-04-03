@@ -35,14 +35,14 @@ use datafusion::optimizer::OptimizerConfig;
 use usearch::MetricKind;
 
 use crate::node::{DistanceType, USearchNode};
-use crate::registry::USearchRegistry;
+use crate::registry::VectorIndexResolver;
 
 pub struct USearchRule {
-    registry: Arc<USearchRegistry>,
+    registry: Arc<dyn VectorIndexResolver>,
 }
 
 impl USearchRule {
-    pub fn new(registry: Arc<USearchRegistry>) -> Self {
+    pub fn new(registry: Arc<dyn VectorIndexResolver>) -> Self {
         Self { registry }
     }
 
@@ -105,7 +105,7 @@ impl USearchRule {
         let reg_key = format!("{}::{}", table_ref_full, vec_col);
 
         // Table must be registered for vector search.
-        let registered = self.registry.get(&reg_key)?;
+        let registered = self.registry.resolve(&reg_key)?;
 
         let dist_type = match udf_name.as_str() {
             "l2_distance" => DistanceType::L2,
