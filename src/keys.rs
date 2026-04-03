@@ -38,6 +38,7 @@ pub fn unpack_key(key: u64) -> (usize, usize, usize) {
 ///
 /// Computed once at startup from parquet file footers (reads only the last few
 /// KB of each file). Not persisted to disk.
+#[derive(Debug)]
 pub struct DatasetLayout {
     /// Object-store path (or S3 key) for each file, indexed by `file_idx`.
     pub file_keys: Vec<String>,
@@ -92,7 +93,19 @@ impl DatasetLayout {
 
         let mut running_total = 0u64;
         for &path in local_paths {
-            let file_name = Path::new(path)
+            let raw = Path::new(path);
+
+            // Reject paths containing '..' components to prevent directory
+            // traversal when paths originate from untrusted input.
+            for component in raw.components() {
+                if matches!(component, std::path::Component::ParentDir) {
+                    return Err(DataFusionError::Execution(format!(
+                        "path traversal not allowed: {path}"
+                    )));
+                }
+            }
+
+            let file_name = raw
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| DataFusionError::Execution(format!("invalid path: {path}")))?;
@@ -160,5 +173,71 @@ mod tests {
     #[should_panic(expected = "overflows 16 bits")]
     fn test_pack_key_file_idx_overflow_panics() {
         pack_key(1 << 16, 0, 0);
+    }
+
+    #[cfg(any(feature = "parquet-provider", feature = "sqlite-provider"))]
+    mod from_files_tests {
+        use super::super::DatasetLayout;
+        use arrow_array::{RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        /// Write a minimal 1-row parquet file at the given path.
+        fn write_parquet(path: &std::path::Path) {
+            let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, true)]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(vec![Some("a")]))],
+            )
+            .unwrap();
+            let file = std::fs::File::create(path).unwrap();
+            let mut w = ArrowWriter::try_new(file, schema, None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+
+        #[test]
+        fn rejects_parent_dir_traversal() {
+            let dir = tempfile::tempdir().unwrap();
+            let sub = dir.path().join("sub");
+            std::fs::create_dir(&sub).unwrap();
+            let file = sub.join("test.parquet");
+            write_parquet(&file);
+
+            // A path using '..' to escape the expected directory must be rejected.
+            let traversal = format!("{}/sub/../sub/test.parquet", dir.path().display());
+            let result = DatasetLayout::from_files(&[&traversal], "");
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("path traversal"),
+                "expected 'path traversal' error, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn rejects_dotdot_prefix_traversal() {
+            // Even relative paths with '..' must be rejected.
+            let result = DatasetLayout::from_files(&["../../../etc/passwd"], "");
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("path traversal"),
+                "expected 'path traversal' error, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn accepts_valid_absolute_path() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("valid.parquet");
+            write_parquet(&file);
+
+            let path_str = file.to_str().unwrap();
+            let layout = DatasetLayout::from_files(&[path_str], "").unwrap();
+            assert_eq!(layout.file_keys, vec!["valid.parquet"]);
+            assert_eq!(layout.file_cum_rows, vec![0, 1]);
+        }
     }
 }
