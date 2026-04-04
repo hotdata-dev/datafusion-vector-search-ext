@@ -35,14 +35,14 @@ use datafusion::optimizer::OptimizerConfig;
 use usearch::MetricKind;
 
 use crate::node::{DistanceType, USearchNode};
-use crate::registry::USearchRegistry;
+use crate::registry::VectorIndexResolver;
 
 pub struct USearchRule {
-    registry: Arc<USearchRegistry>,
+    registry: Arc<dyn VectorIndexResolver>,
 }
 
 impl USearchRule {
-    pub fn new(registry: Arc<USearchRegistry>) -> Self {
+    pub fn new(registry: Arc<dyn VectorIndexResolver>) -> Self {
         Self { registry }
     }
 
@@ -104,8 +104,8 @@ impl USearchRule {
         // Registry key: "catalog::schema::table::col" (or fewer parts for bare refs).
         let reg_key = format!("{}::{}", table_ref_full, vec_col);
 
-        // Table must be registered for vector search.
-        let registered = self.registry.get(&reg_key)?;
+        // Sync check: does a vector index exist for this key?
+        let meta = self.registry.peek(&reg_key)?;
 
         let dist_type = match udf_name.as_str() {
             "l2_distance" => DistanceType::L2,
@@ -116,14 +116,14 @@ impl USearchRule {
 
         // Guard: the SQL distance UDF must match the metric the index was built
         // with. Mismatch → return None so DataFusion falls back to exact scan.
-        if !dist_type_matches_metric(&dist_type, registered.metric) {
+        if !dist_type_matches_metric(&dist_type, meta.metric) {
             return None;
         }
 
         // Build USearchNode schema: base fields qualified with the original table
         // reference (Full/Partial/Bare) so qualifiers match the original plan's schema.
         let table_ref = scan_table_ref.clone();
-        let qualified_fields: Vec<(Option<TableReference>, Arc<arrow_schema::Field>)> = registered
+        let qualified_fields: Vec<(Option<TableReference>, Arc<arrow_schema::Field>)> = meta
             .schema
             .fields()
             .iter()

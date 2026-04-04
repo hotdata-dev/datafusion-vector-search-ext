@@ -33,7 +33,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::scalar::ScalarValue;
 
-use crate::registry::USearchRegistry;
+use crate::registry::VectorIndexResolver;
 
 // ── UDTF ─────────────────────────────────────────────────────────────────────
 
@@ -41,8 +41,13 @@ use crate::registry::USearchRegistry;
 ///
 /// Returns `(key: UInt64, _distance: Float32)`. Join with your data table on
 /// the key column to retrieve full rows.
+///
+/// This entry point is synchronous. For async-backed [`VectorIndexResolver`]
+/// implementations, it only works when the target index is already loaded in
+/// the local cache. `vector_usearch()` does not call `ensure_loaded()` and
+/// cannot trigger async index loads.
 pub struct USearchUDTF {
-    registry: Arc<USearchRegistry>,
+    registry: Arc<dyn VectorIndexResolver>,
 }
 
 impl fmt::Debug for USearchProvider {
@@ -58,7 +63,7 @@ impl fmt::Debug for USearchUDTF {
 }
 
 impl USearchUDTF {
-    pub fn new(registry: Arc<USearchRegistry>) -> Self {
+    pub fn new(registry: Arc<dyn VectorIndexResolver>) -> Self {
         Self { registry }
     }
 }
@@ -85,9 +90,11 @@ impl TableFunctionImpl for USearchUDTF {
             None
         };
 
-        let registered = self.registry.get(&table_name).ok_or_else(|| {
+        let registered = self.registry.resolve(&table_name).ok_or_else(|| {
             DataFusionError::Execution(format!(
-                "vector_usearch: table '{table_name}' not registered"
+                "vector_usearch: table '{table_name}' is not loaded locally. \
+This synchronous path only checks the local cache and cannot trigger async \
+loads. Use the optimizer/planner vector query path or pre-load the index first."
             ))
         })?;
 

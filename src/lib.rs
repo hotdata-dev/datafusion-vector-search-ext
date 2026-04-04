@@ -74,7 +74,10 @@ pub use keys::{DatasetLayout, pack_key, unpack_key};
 pub use lookup::{HashKeyProvider, PointLookupProvider};
 pub use node::{DistanceType, USearchNode};
 pub use planner::{USearchExec, USearchExecPlanner, USearchQueryPlanner};
-pub use registry::{RegisteredTable, USearchIndexConfig, USearchRegistry, USearchTableConfig};
+pub use registry::{
+    RegisteredTable, USearchIndexConfig, USearchRegistry, USearchTableConfig, VectorIndexMeta,
+    VectorIndexResolver,
+};
 pub use rule::USearchRule;
 pub use udf::{cosine_distance_udf, l2_distance_udf, negative_dot_product_udf};
 pub use udtf::USearchUDTF;
@@ -97,16 +100,19 @@ use datafusion::prelude::SessionContext;
 /// - `cosine_distance(col, query)`      — cosine distance
 /// - `negative_dot_product(col, query)` — negated inner product
 /// - `vector_usearch(table, query, k)`  — explicit ANN table function
+///   (cache-only for async-backed resolvers; does not trigger async loads)
 /// - [`USearchRule`]                    — optimizer rewrite rule
 ///
 /// The [`USearchQueryPlanner`] must be installed at `SessionState` build time
 /// (before this call) via `SessionStateBuilder::with_query_planner`.
-pub fn register_all(ctx: &SessionContext, registry: Arc<USearchRegistry>) -> Result<()> {
+pub fn register_all(ctx: &SessionContext, registry: Arc<dyn VectorIndexResolver>) -> Result<()> {
     ctx.register_udf(ScalarUDF::new_from_impl(l2_distance_udf()));
     ctx.register_udf(ScalarUDF::new_from_impl(cosine_distance_udf()));
     ctx.register_udf(ScalarUDF::new_from_impl(negative_dot_product_udf()));
     ctx.register_udtf(
         "vector_usearch",
+        // `vector_usearch()` is synchronous and therefore cache-only for
+        // async-backed resolvers.
         Arc::new(USearchUDTF::new(registry.clone())),
     );
     ctx.add_optimizer_rule(Arc::new(USearchRule::new(registry)));
