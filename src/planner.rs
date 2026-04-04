@@ -361,10 +361,13 @@ async fn usearch_execute(
     params: SearchParams,
     task_ctx: Arc<TaskContext>,
 ) -> Result<Vec<RecordBatch>> {
-    // Re-fetch at execute time so cache eviction between plan and execute is handled correctly.
+    // Re-fetch at execute time and reload on cache miss so eviction between
+    // plan and execute is handled correctly for async-backed resolvers.
+    params.registry.ensure_loaded(&params.table_name).await?;
+
     let registered = params.registry.resolve(&params.table_name).ok_or_else(|| {
         DataFusionError::Execution(format!(
-            "USearchExec: table '{}' not in registry at execute time",
+            "USearchExec: table '{}' not available after ensure_loaded at execute time",
             params.table_name
         ))
     })?;
