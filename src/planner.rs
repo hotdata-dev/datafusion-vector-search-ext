@@ -140,12 +140,14 @@ impl ExtensionPlanner for USearchExecPlanner {
             None => return Ok(None),
         };
 
-        // Cheap validation: RwLock read + HashMap lookup — no I/O.
+        // Async: ensure the index is loaded (downloads on cache miss).
+        self.registry.ensure_loaded(&node.table_name).await?;
+
         let registered = match self.registry.resolve(&node.table_name) {
             Some(r) => r,
             None => {
                 return Err(DataFusionError::Execution(format!(
-                    "USearchExecPlanner: table '{}' not in registry",
+                    "USearchExecPlanner: table '{}' not available after ensure_loaded",
                     node.table_name
                 )));
             }

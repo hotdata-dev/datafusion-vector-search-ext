@@ -75,7 +75,7 @@ pub use lookup::{HashKeyProvider, PointLookupProvider};
 pub use node::{DistanceType, USearchNode};
 pub use planner::{USearchExec, USearchExecPlanner, USearchQueryPlanner};
 pub use registry::{
-    RegisteredTable, USearchIndexConfig, USearchRegistry, USearchTableConfig,
+    RegisteredTable, USearchIndexConfig, USearchRegistry, USearchTableConfig, VectorIndexMeta,
     VectorIndexResolver,
 };
 pub use rule::USearchRule;
