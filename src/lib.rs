@@ -100,6 +100,7 @@ use datafusion::prelude::SessionContext;
 /// - `cosine_distance(col, query)`      — cosine distance
 /// - `negative_dot_product(col, query)` — negated inner product
 /// - `vector_usearch(table, query, k)`  — explicit ANN table function
+///   (cache-only for async-backed resolvers; does not trigger async loads)
 /// - [`USearchRule`]                    — optimizer rewrite rule
 ///
 /// The [`USearchQueryPlanner`] must be installed at `SessionState` build time
@@ -110,6 +111,8 @@ pub fn register_all(ctx: &SessionContext, registry: Arc<dyn VectorIndexResolver>
     ctx.register_udf(ScalarUDF::new_from_impl(negative_dot_product_udf()));
     ctx.register_udtf(
         "vector_usearch",
+        // `vector_usearch()` is synchronous and therefore cache-only for
+        // async-backed resolvers.
         Arc::new(USearchUDTF::new(registry.clone())),
     );
     ctx.add_optimizer_rule(Arc::new(USearchRule::new(registry)));
