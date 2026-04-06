@@ -140,18 +140,8 @@ impl ExtensionPlanner for USearchExecPlanner {
             None => return Ok(None),
         };
 
-        // Async: ensure the index is loaded (downloads on cache miss).
-        self.registry.ensure_loaded(&node.table_name).await?;
-
-        let registered = match self.registry.resolve(&node.table_name) {
-            Some(r) => r,
-            None => {
-                return Err(DataFusionError::Execution(format!(
-                    "USearchExecPlanner: table '{}' not available after ensure_loaded",
-                    node.table_name
-                )));
-            }
-        };
+        // Async: bind a query-stable registry entry during planning.
+        let registered = self.registry.prepare(&node.table_name).await?;
 
         let exec_props = session_state.execution_props();
 
@@ -225,15 +215,11 @@ impl ExtensionPlanner for USearchExecPlanner {
 
         Ok(Some(Arc::new(USearchExec::new(SearchParams {
             table_name: node.table_name.clone(),
-            registry: self.registry.clone(),
+            registered,
             query_vec: node.query_vec_f64(),
             k: node.k,
             distance_type: node.distance_type.clone(),
             has_filters: !node.filters.is_empty(),
-            schema: registered.schema.clone(),
-            key_col: registered.key_col.clone(),
-            scalar_kind: registered.scalar_kind,
-            brute_force_threshold: registered.config.brute_force_selectivity_threshold,
             provider_scan,
         }))))
     }
@@ -242,23 +228,40 @@ impl ExtensionPlanner for USearchExecPlanner {
 // ── Search parameters ─────────────────────────────────────────────────────────
 
 /// All parameters needed to run a USearch query, cloned cheaply into execute().
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SearchParams {
     table_name: String,
-    registry: Arc<dyn VectorIndexResolver>,
+    registered: Arc<crate::registry::RegisteredTable>,
     query_vec: Vec<f64>,
     k: usize,
     distance_type: DistanceType,
     /// Whether the query has WHERE-clause filters. Used to choose between the
     /// unfiltered HNSW path and the adaptive filtered path.
     has_filters: bool,
-    schema: SchemaRef,
-    key_col: String,
-    scalar_kind: ScalarKind,
-    brute_force_threshold: f64,
     /// Pre-planned provider scan for the filtered path (_key + filter cols only).
     /// Used for selectivity estimation. None for the unfiltered path.
     provider_scan: Option<Arc<dyn ExecutionPlan>>,
+}
+
+impl fmt::Debug for SearchParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SearchParams")
+            .field("table_name", &self.table_name)
+            .field("k", &self.k)
+            .field("has_filters", &self.has_filters)
+            .field("schema", &self.registered.schema)
+            .field("key_col", &self.registered.key_col)
+            .field("scalar_kind", &self.registered.scalar_kind)
+            .field(
+                "brute_force_threshold",
+                &self.registered.config.brute_force_selectivity_threshold,
+            )
+            .field(
+                "provider_scan",
+                &self.provider_scan.as_ref().map(|_| "Some(..)"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 // ── Physical execution node ───────────────────────────────────────────────────
@@ -273,7 +276,7 @@ pub struct USearchExec {
 impl USearchExec {
     fn new(params: SearchParams) -> Self {
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(params.schema.clone()),
+            EquivalenceProperties::new(params.registered.schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -340,7 +343,7 @@ impl ExecutionPlan for USearchExec {
             });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.params.schema.clone(),
+            self.params.registered.schema.clone(),
             stream,
         )))
     }
@@ -361,16 +364,7 @@ async fn usearch_execute(
     params: SearchParams,
     task_ctx: Arc<TaskContext>,
 ) -> Result<Vec<RecordBatch>> {
-    // Re-fetch at execute time and reload on cache miss so eviction between
-    // plan and execute is handled correctly for async-backed resolvers.
-    params.registry.ensure_loaded(&params.table_name).await?;
-
-    let registered = params.registry.resolve(&params.table_name).ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "USearchExec: table '{}' not available after ensure_loaded at execute time",
-            params.table_name
-        ))
-    })?;
+    let registered = params.registered.clone();
 
     if !params.has_filters {
         // ── Unfiltered path ───────────────────────────────────────────────
@@ -385,7 +379,7 @@ async fn usearch_execute(
                 &registered.index,
                 &params.query_vec,
                 params.k,
-                params.scalar_kind,
+                registered.scalar_kind,
             )?
         };
 
@@ -404,7 +398,7 @@ async fn usearch_execute(
         let data_batches = async {
             registered
                 .lookup_provider
-                .fetch_by_keys(&matches.keys, &params.key_col, None)
+                .fetch_by_keys(&matches.keys, &registered.key_col, None)
                 .await
         }
         .instrument(tracing::info_span!(
@@ -415,7 +409,7 @@ async fn usearch_execute(
 
         let key_col_idx = provider_key_col_idx(&registered)?;
         let _span = tracing::info_span!("usearch_attach_distances").entered();
-        attach_distances(data_batches, key_col_idx, &key_to_dist, &params.schema)
+        attach_distances(data_batches, key_col_idx, &key_to_dist, &registered.schema)
     } else {
         // ── Adaptive filtered path ────────────────────────────────────────
         let scan = params.provider_scan.clone().ok_or_else(|| {
@@ -489,7 +483,7 @@ async fn adaptive_filtered_execute(
 
     let total = registered.index.size();
     let selectivity = valid_keys.len() as f64 / total.max(1) as f64;
-    let threshold = params.brute_force_threshold;
+    let threshold = registered.config.brute_force_selectivity_threshold;
 
     let path = if selectivity <= threshold {
         "index-get"
@@ -535,7 +529,7 @@ async fn adaptive_filtered_execute(
         let data_batches = async {
             registered
                 .lookup_provider
-                .fetch_by_keys(&fetch_keys, &params.key_col, None)
+                .fetch_by_keys(&fetch_keys, &registered.key_col, None)
                 .await
         }
         .instrument(tracing::info_span!(
@@ -550,7 +544,7 @@ async fn adaptive_filtered_execute(
                 data_batches,
                 lookup_key_col_idx,
                 &key_to_dist,
-                &params.schema,
+                &registered.schema,
             )?
         };
 
@@ -591,7 +585,7 @@ async fn adaptive_filtered_execute(
         let data_batches = async {
             registered
                 .lookup_provider
-                .fetch_by_keys(&matches.keys, &params.key_col, None)
+                .fetch_by_keys(&matches.keys, &registered.key_col, None)
                 .await
         }
         .instrument(tracing::info_span!(
@@ -606,7 +600,7 @@ async fn adaptive_filtered_execute(
                 data_batches,
                 lookup_key_col_idx,
                 &key_to_dist,
-                &params.schema,
+                &registered.schema,
             )?
         };
 
