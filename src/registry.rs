@@ -230,14 +230,16 @@ pub struct VectorIndexMeta {
 
 /// Trait for resolving vector index entries by name.
 ///
-/// Split into two operations to accommodate DataFusion's mixed sync/async pipeline:
+/// DataFusion's optimizer is synchronous but physical planning is async, so the
+/// resolver exposes two levels:
 /// - `peek()` — sync, cheap: used by the optimizer rule to decide if ANN rewrite applies
-/// - `resolve()` — sync: returns fully loaded entry from cache (for executor hot path)
-/// - `ensure_loaded()` — async: loads the index on cache miss (for planner/executor)
+/// - `resolve()` — sync, cache-only: used by synchronous callers such as the UDTF
+/// - `prepare()` — async: returns a query-stable loaded entry for planning/execution
 ///
-/// The built-in [`USearchRegistry`] implements all three as direct hashmap lookups
-/// (always cached). Production systems can implement catalog-backed loading in
-/// `ensure_loaded`.
+/// The important contract is that `prepare()` returns the exact loaded
+/// [`RegisteredTable`] the query should execute against. This avoids a second
+/// lookup during execution and removes the planner/execute handoff gap where a
+/// newer generation could replace the registry entry mid-query.
 #[async_trait::async_trait]
 pub trait VectorIndexResolver: Send + Sync + std::fmt::Debug {
     /// Sync, cheap: check if a vector index exists and return its metadata.
@@ -245,15 +247,17 @@ pub trait VectorIndexResolver: Send + Sync + std::fmt::Debug {
     /// Must NOT do I/O — only check local cache or lightweight state.
     fn peek(&self, name: &str) -> Option<VectorIndexMeta>;
 
-    /// Sync: return a fully loaded entry from cache.
-    /// Returns `None` on cache miss — the caller should call `ensure_loaded` first.
+    /// Sync, cache-only: return a fully loaded entry from local cache.
+    /// Returns `None` on cache miss.
     fn resolve(&self, name: &str) -> Option<Arc<RegisteredTable>>;
 
-    /// Async: ensure the index is loaded and available in cache.
-    /// On cache miss or stale entry, downloads files and loads the index.
-    /// On cache hit with current generation, returns immediately.
-    /// Called from the async physical planner before building the execution plan.
-    async fn ensure_loaded(&self, name: &str) -> datafusion::common::Result<()>;
+    /// Async: return a query-stable loaded entry.
+    ///
+    /// On cache miss or stale entry, implementations may download files and
+    /// load the current generation. On success, the returned [`Arc`] must stay
+    /// valid for the lifetime of the query even if a newer generation is loaded
+    /// concurrently afterwards.
+    async fn prepare(&self, name: &str) -> datafusion::common::Result<Arc<RegisteredTable>>;
 }
 
 // ── USearchRegistry ───────────────────────────────────────────────────────────
@@ -438,9 +442,10 @@ impl VectorIndexResolver for USearchRegistry {
         self.get(name)
     }
 
-    async fn ensure_loaded(&self, _name: &str) -> datafusion::common::Result<()> {
-        // USearchRegistry is always fully cached — nothing to load.
-        Ok(())
+    async fn prepare(&self, name: &str) -> datafusion::common::Result<Arc<RegisteredTable>> {
+        self.get(name).ok_or_else(|| {
+            DataFusionError::Execution(format!("USearchRegistry: table '{name}' is not loaded"))
+        })
     }
 }
 

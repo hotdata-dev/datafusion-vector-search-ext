@@ -44,8 +44,8 @@ use crate::registry::VectorIndexResolver;
 ///
 /// This entry point is synchronous. For async-backed [`VectorIndexResolver`]
 /// implementations, it only works when the target index is already loaded in
-/// the local cache. `vector_usearch()` does not call `ensure_loaded()` and
-/// cannot trigger async index loads.
+/// the local cache. `vector_usearch()` does not call `prepare()` and cannot
+/// trigger async index loads.
 pub struct USearchUDTF {
     registry: Arc<dyn VectorIndexResolver>,
 }

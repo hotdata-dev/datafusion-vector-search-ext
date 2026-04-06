@@ -140,18 +140,8 @@ impl ExtensionPlanner for USearchExecPlanner {
             None => return Ok(None),
         };
 
-        // Async: ensure the index is loaded (downloads on cache miss).
-        self.registry.ensure_loaded(&node.table_name).await?;
-
-        let registered = match self.registry.resolve(&node.table_name) {
-            Some(r) => r,
-            None => {
-                return Err(DataFusionError::Execution(format!(
-                    "USearchExecPlanner: table '{}' not available after ensure_loaded",
-                    node.table_name
-                )));
-            }
-        };
+        // Async: bind a query-stable registry entry during planning.
+        let registered = self.registry.prepare(&node.table_name).await?;
 
         let exec_props = session_state.execution_props();
 
@@ -223,17 +213,22 @@ impl ExtensionPlanner for USearchExecPlanner {
             None
         };
 
+        let schema = registered.schema.clone();
+        let key_col = registered.key_col.clone();
+        let scalar_kind = registered.scalar_kind;
+        let brute_force_threshold = registered.config.brute_force_selectivity_threshold;
+
         Ok(Some(Arc::new(USearchExec::new(SearchParams {
             table_name: node.table_name.clone(),
-            registry: self.registry.clone(),
+            registered,
             query_vec: node.query_vec_f64(),
             k: node.k,
             distance_type: node.distance_type.clone(),
             has_filters: !node.filters.is_empty(),
-            schema: registered.schema.clone(),
-            key_col: registered.key_col.clone(),
-            scalar_kind: registered.scalar_kind,
-            brute_force_threshold: registered.config.brute_force_selectivity_threshold,
+            schema,
+            key_col,
+            scalar_kind,
+            brute_force_threshold,
             provider_scan,
         }))))
     }
@@ -242,10 +237,10 @@ impl ExtensionPlanner for USearchExecPlanner {
 // ── Search parameters ─────────────────────────────────────────────────────────
 
 /// All parameters needed to run a USearch query, cloned cheaply into execute().
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SearchParams {
     table_name: String,
-    registry: Arc<dyn VectorIndexResolver>,
+    registered: Arc<crate::registry::RegisteredTable>,
     query_vec: Vec<f64>,
     k: usize,
     distance_type: DistanceType,
@@ -259,6 +254,24 @@ struct SearchParams {
     /// Pre-planned provider scan for the filtered path (_key + filter cols only).
     /// Used for selectivity estimation. None for the unfiltered path.
     provider_scan: Option<Arc<dyn ExecutionPlan>>,
+}
+
+impl fmt::Debug for SearchParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SearchParams")
+            .field("table_name", &self.table_name)
+            .field("k", &self.k)
+            .field("has_filters", &self.has_filters)
+            .field("schema", &self.schema)
+            .field("key_col", &self.key_col)
+            .field("scalar_kind", &self.scalar_kind)
+            .field("brute_force_threshold", &self.brute_force_threshold)
+            .field(
+                "provider_scan",
+                &self.provider_scan.as_ref().map(|_| "Some(..)"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 // ── Physical execution node ───────────────────────────────────────────────────
@@ -361,16 +374,7 @@ async fn usearch_execute(
     params: SearchParams,
     task_ctx: Arc<TaskContext>,
 ) -> Result<Vec<RecordBatch>> {
-    // Re-fetch at execute time and reload on cache miss so eviction between
-    // plan and execute is handled correctly for async-backed resolvers.
-    params.registry.ensure_loaded(&params.table_name).await?;
-
-    let registered = params.registry.resolve(&params.table_name).ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "USearchExec: table '{}' not available after ensure_loaded at execute time",
-            params.table_name
-        ))
-    })?;
+    let registered = params.registered.clone();
 
     if !params.has_filters {
         // ── Unfiltered path ───────────────────────────────────────────────
