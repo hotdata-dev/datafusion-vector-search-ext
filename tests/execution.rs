@@ -530,6 +530,17 @@ async fn exec_split_provider_select_specific_columns() {
     assert_eq!(ids.len(), 2, "expected 2 results; got {ids:?}");
 }
 
+/// SELECT specific columns without projecting the distance expression.
+/// This is the production shape behind `vector_distance(...)`.
+#[tokio::test]
+async fn exec_split_provider_order_by_udf_direct() {
+    let ctx = make_split_provider_ctx("items::vector").await;
+    let sql = format!("SELECT id FROM items ORDER BY l2_distance(vector, {Q}) ASC LIMIT 2");
+    let ids = collect_ids(&ctx, &sql).await;
+    assert_eq!(ids[0], 1, "closest must be row 1\nids: {ids:?}");
+    assert_eq!(ids.len(), 2, "expected 2 results; got {ids:?}");
+}
+
 /// SELECT * with distance UDF — should fall back to UDF brute-force
 /// (since vector column is not in lookup provider schema).
 #[tokio::test]
