@@ -160,9 +160,9 @@ impl USearchRule {
             remap_projections(proj_exprs_slice, dist_alias_str, &table_ref)
         };
         let remapped_sort_exprs = remap_sort_exprs(&sort.expr, dist_alias.as_deref());
-        let needs_hidden_distance = remapped_sort_exprs.iter().any(|e| {
-            matches!(&e.expr, Expr::Column(c) if c.relation.is_none() && c.name == "_distance")
-        }) && !projection_exposes_name(&final_proj_exprs, "_distance");
+        let needs_hidden_distance = remapped_sort_exprs.iter().any(
+            |e| matches!(&e.expr, Expr::Column(c) if c.relation.is_none() && c.name == "_distance"),
+        ) && !projection_exposes_name(&final_proj_exprs, "_distance");
 
         let mut sort_input_exprs = final_proj_exprs.clone();
         if needs_hidden_distance {
@@ -365,7 +365,8 @@ fn projection_exposes_name(exprs: &[Expr], name: &str) -> bool {
 }
 
 fn build_outer_projection(exprs: &[Expr]) -> Vec<Expr> {
-    exprs.iter()
+    exprs
+        .iter()
         .filter_map(|expr| match expr {
             Expr::Alias(a) => Some(col(a.name.as_str())),
             Expr::Column(c) => Some(Expr::Column(c.clone())),

@@ -531,7 +531,8 @@ async fn exec_split_provider_select_specific_columns() {
 }
 
 /// SELECT specific columns without projecting the distance expression.
-/// This is the production shape behind `vector_distance(...)`.
+/// This matches the split-provider direct ORDER BY shape used by callers that
+/// rewrite higher-level search helpers into the low-level distance UDF.
 #[tokio::test]
 async fn exec_split_provider_order_by_udf_direct() {
     let ctx = make_split_provider_ctx("items::vector").await;
