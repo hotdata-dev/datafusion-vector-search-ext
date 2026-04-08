@@ -18,9 +18,10 @@
 //
 // Replacement:
 //
-//   Sort(fetch=k)                                             ← kept (sort order)
-//     Projection([col(a), col(b), col("_distance").alias("dist")])
-//       USearchNode                                           ← executes ANN
+//   Projection([final output cols])
+//     Sort(fetch=k)
+//       Projection([final output cols + optional hidden _distance])
+//         USearchNode
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -151,25 +152,33 @@ impl USearchRule {
             node: Arc::new(node) as Arc<dyn UserDefinedLogicalNode>,
         }));
 
-        // Build Projection over USearchNode matching the original output schema.
+        // Build the final user-visible projection over USearchNode output.
         let dist_alias_str = dist_alias.as_deref().unwrap_or("_distance");
-        let new_proj_exprs = if proj_exprs_slice.is_empty() {
+        let final_proj_exprs = if proj_exprs_slice.is_empty() {
             passthrough_projection(&vsn_df_schema, &table_ref)
         } else {
             remap_projections(proj_exprs_slice, dist_alias_str, &table_ref)
         };
-        let new_proj = Projection::try_new(new_proj_exprs, node_plan).ok()?;
+        let remapped_sort_exprs = remap_sort_exprs(&sort.expr, dist_alias.as_deref());
+        let needs_hidden_distance = remapped_sort_exprs.iter().any(
+            |e| matches!(&e.expr, Expr::Column(c) if c.relation.is_none() && c.name == "_distance"),
+        ) && !projection_exposes_name(&final_proj_exprs, "_distance");
 
-        // Keep the Sort node so DataFusion handles ordering by _distance / dist.
-        // USearch returns results in arbitrary (internal) order when the underlying
-        // data is fetched from the TableProvider.
-        Some(LogicalPlan::Sort(
-            datafusion::logical_expr::logical_plan::Sort {
-                expr: sort.expr.clone(),
-                input: Arc::new(LogicalPlan::Projection(new_proj)),
-                fetch: sort.fetch,
-            },
-        ))
+        let mut sort_input_exprs = final_proj_exprs.clone();
+        if needs_hidden_distance {
+            sort_input_exprs.push(col("_distance"));
+        }
+
+        let sort_input = Projection::try_new(sort_input_exprs, node_plan).ok()?;
+        let sorted = LogicalPlan::Sort(datafusion::logical_expr::logical_plan::Sort {
+            expr: remapped_sort_exprs,
+            input: Arc::new(LogicalPlan::Projection(sort_input)),
+            fetch: sort.fetch,
+        });
+
+        let outer_proj_exprs = build_outer_projection(&final_proj_exprs);
+        let outer_proj = Projection::try_new(outer_proj_exprs, Arc::new(sorted)).ok()?;
+        Some(LogicalPlan::Projection(outer_proj))
     }
 }
 
@@ -283,7 +292,11 @@ fn dist_type_matches_metric(dist_type: &DistanceType, metric: MetricKind) -> boo
 }
 
 fn is_distance_expr(expr: &Expr) -> bool {
-    matches!(expr, Expr::ScalarFunction(sf) if is_dist_udf_name(sf.func.name()))
+    let inner = match expr {
+        Expr::Alias(a) => a.expr.as_ref(),
+        other => other,
+    };
+    matches!(inner, Expr::ScalarFunction(sf) if is_dist_udf_name(sf.func.name()))
 }
 
 fn try_extract_distance(expr: &Expr) -> Option<(String, String, Vec<f64>)> {
@@ -319,6 +332,46 @@ fn remap_projections(
     proj_exprs
         .iter()
         .map(|e| remap_one(e, dist_alias_name, table_ref))
+        .collect()
+}
+
+fn remap_sort_exprs(
+    sort_exprs: &[datafusion::logical_expr::SortExpr],
+    dist_alias_name: Option<&str>,
+) -> Vec<datafusion::logical_expr::SortExpr> {
+    sort_exprs
+        .iter()
+        .map(|sort_expr| {
+            let remapped_expr = match &sort_expr.expr {
+                Expr::Column(c) if Some(c.name.as_str()) == dist_alias_name => col(c.name.as_str()),
+                expr if is_distance_expr(expr) => col("_distance"),
+                other => other.clone(),
+            };
+            datafusion::logical_expr::SortExpr {
+                expr: remapped_expr,
+                asc: sort_expr.asc,
+                nulls_first: sort_expr.nulls_first,
+            }
+        })
+        .collect()
+}
+
+fn projection_exposes_name(exprs: &[Expr], name: &str) -> bool {
+    exprs.iter().any(|expr| match expr {
+        Expr::Alias(a) => a.name == name,
+        Expr::Column(c) => c.name == name,
+        _ => false,
+    })
+}
+
+fn build_outer_projection(exprs: &[Expr]) -> Vec<Expr> {
+    exprs
+        .iter()
+        .map(|expr| match expr {
+            Expr::Alias(a) => col(a.name.as_str()),
+            Expr::Column(c) => Expr::Column(c.clone()),
+            other => col(other.schema_name().to_string()),
+        })
         .collect()
 }
 

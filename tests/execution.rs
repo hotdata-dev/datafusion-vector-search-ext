@@ -19,7 +19,9 @@
 use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
-use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
@@ -150,6 +152,60 @@ async fn collect_ids(ctx: &SessionContext, sql: &str) -> Vec<u64> {
         ids.extend(arr.values());
     }
     ids
+}
+
+/// Collect a named integer column from a query result.
+async fn collect_i64_column(ctx: &SessionContext, sql: &str, column_name: &str) -> Vec<i64> {
+    let df = ctx
+        .sql(sql)
+        .await
+        .unwrap_or_else(|e| panic!("sql() failed: {e}\nSQL: {sql}"));
+    let batches = df
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("collect() failed: {e}\nSQL: {sql}"));
+
+    let mut values: Vec<i64> = vec![];
+    for batch in &batches {
+        let col_idx = batch
+            .schema()
+            .index_of(column_name)
+            .unwrap_or_else(|e| panic!("no '{column_name}' column in result: {e}\nSQL: {sql}"));
+        let column = batch.column(col_idx);
+        if let Some(arr) = column.as_any().downcast_ref::<UInt64Array>() {
+            values.extend(arr.values().iter().map(|v| *v as i64));
+        } else if let Some(arr) = column.as_any().downcast_ref::<Int64Array>() {
+            values.extend(arr.values());
+        } else {
+            panic!("column '{column_name}' not Int64/UInt64\nSQL: {sql}");
+        }
+    }
+    values
+}
+
+/// Collect the first integer column from a query result.
+async fn collect_first_i64_column(ctx: &SessionContext, sql: &str) -> Vec<i64> {
+    let df = ctx
+        .sql(sql)
+        .await
+        .unwrap_or_else(|e| panic!("sql() failed: {e}\nSQL: {sql}"));
+    let batches = df
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("collect() failed: {e}\nSQL: {sql}"));
+
+    let mut values: Vec<i64> = vec![];
+    for batch in &batches {
+        let column = batch.column(0);
+        if let Some(arr) = column.as_any().downcast_ref::<UInt64Array>() {
+            values.extend(arr.values().iter().map(|v| *v as i64));
+        } else if let Some(arr) = column.as_any().downcast_ref::<Int64Array>() {
+            values.extend(arr.values());
+        } else {
+            panic!("first result column not Int64/UInt64\nSQL: {sql}");
+        }
+    }
+    values
 }
 
 const Q: &str = "ARRAY[1.0::float, 0.0::float, 0.0::float, 0.0::float]";
@@ -528,6 +584,42 @@ async fn exec_split_provider_select_specific_columns() {
     let ids = collect_ids(&ctx, &sql).await;
     assert_eq!(ids[0], 1, "closest must be row 1\nids: {ids:?}");
     assert_eq!(ids.len(), 2, "expected 2 results; got {ids:?}");
+}
+
+/// SELECT specific columns without projecting the distance expression.
+/// This matches the split-provider direct ORDER BY shape used by callers that
+/// rewrite higher-level search helpers into the low-level distance UDF.
+#[tokio::test]
+async fn exec_split_provider_order_by_udf_direct() {
+    let ctx = make_split_provider_ctx("items::vector").await;
+    let sql = format!("SELECT id FROM items ORDER BY l2_distance(vector, {Q}) ASC LIMIT 2");
+    let ids = collect_ids(&ctx, &sql).await;
+    assert_eq!(ids[0], 1, "closest must be row 1\nids: {ids:?}");
+    assert_eq!(ids.len(), 2, "expected 2 results; got {ids:?}");
+}
+
+/// Direct ORDER BY UDF with an aliased computed projection must preserve the
+/// computed output through the rewrite.
+#[tokio::test]
+async fn exec_split_provider_order_by_udf_with_computed_alias() {
+    let ctx = make_split_provider_ctx("items::vector").await;
+    let sql = format!(
+        "SELECT CAST(id + 1 AS BIGINT) AS id_plus FROM items ORDER BY l2_distance(vector, {Q}) ASC LIMIT 2"
+    );
+    let values = collect_i64_column(&ctx, &sql, "id_plus").await;
+    assert_eq!(values, vec![2, 3], "unexpected computed values: {values:?}");
+}
+
+/// Direct ORDER BY UDF with an unaliased computed projection relies on the
+/// outer projection rebuilding by schema name rather than by raw expression.
+#[tokio::test]
+async fn exec_split_provider_order_by_udf_with_computed_expr() {
+    let ctx = make_split_provider_ctx("items::vector").await;
+    let sql = format!(
+        "SELECT CAST(id + 1 AS BIGINT) FROM items ORDER BY l2_distance(vector, {Q}) ASC LIMIT 2"
+    );
+    let values = collect_first_i64_column(&ctx, &sql).await;
+    assert_eq!(values, vec![2, 3], "unexpected computed values: {values:?}");
 }
 
 /// SELECT * with distance UDF — should fall back to UDF brute-force
