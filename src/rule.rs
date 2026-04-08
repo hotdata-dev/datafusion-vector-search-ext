@@ -367,10 +367,10 @@ fn projection_exposes_name(exprs: &[Expr], name: &str) -> bool {
 fn build_outer_projection(exprs: &[Expr]) -> Vec<Expr> {
     exprs
         .iter()
-        .filter_map(|expr| match expr {
-            Expr::Alias(a) => Some(col(a.name.as_str())),
-            Expr::Column(c) => Some(Expr::Column(c.clone())),
-            _ => None,
+        .map(|expr| match expr {
+            Expr::Alias(a) => col(a.name.as_str()),
+            Expr::Column(c) => Expr::Column(c.clone()),
+            other => col(other.schema_name().to_string()),
         })
         .collect()
 }
