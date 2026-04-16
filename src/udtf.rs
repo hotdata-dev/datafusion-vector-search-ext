@@ -69,7 +69,7 @@ impl TableFunctionImpl for VectorSearchVectorUDTF {
 
         let table_ref = extract_string_literal(&exprs[0])?;
         let column = extract_string_literal(&exprs[1])?;
-        let query_vec = extract_f32_vec(&exprs[2])?;
+        let query_vec = extract_f64_vec(&exprs[2])?;
         let k = extract_usize_literal(&exprs[3])?;
 
         // Build the registry key: "conn::schema::table::column"
@@ -97,7 +97,7 @@ impl TableFunctionImpl for VectorSearchVectorUDTF {
 /// fetches full rows via the lookup provider, and appends `_distance`.
 struct VectorSearchVectorProvider {
     registered: Arc<RegisteredTable>,
-    query_vec: Vec<f32>,
+    query_vec: Vec<f64>,
     k: usize,
 }
 
@@ -130,10 +130,9 @@ impl TableProvider for VectorSearchVectorProvider {
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // 1. HNSW search
-        let query_f64: Vec<f64> = self.query_vec.iter().map(|&v| v as f64).collect();
         let matches = usearch_search(
             &self.registered.index,
-            &query_f64,
+            &self.query_vec,
             self.k,
             self.registered.scalar_kind,
         )?;
@@ -311,7 +310,7 @@ fn extract_usize_literal(expr: &Expr) -> Result<usize> {
     }
 }
 
-fn extract_f32_vec(expr: &Expr) -> Result<Vec<f32>> {
+fn extract_f64_vec(expr: &Expr) -> Result<Vec<f64>> {
     use arrow_array::{Float32Array, Float64Array};
 
     match expr {
@@ -320,11 +319,11 @@ fn extract_f32_vec(expr: &Expr) -> Result<Vec<f32>> {
                 return Err(DataFusionError::Execution("Empty query vector".into()));
             }
             let inner = arr.value(0);
-            if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
-                return Ok(f32a.values().to_vec());
-            }
             if let Some(f64a) = inner.as_any().downcast_ref::<Float64Array>() {
-                return Ok(f64a.values().iter().map(|&v| v as f32).collect());
+                return Ok(f64a.values().to_vec());
+            }
+            if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
+                return Ok(f32a.values().iter().map(|&v| v as f64).collect());
             }
             Err(DataFusionError::Execution(
                 "FixedSizeList inner is not Float32/Float64".into(),
@@ -335,11 +334,11 @@ fn extract_f32_vec(expr: &Expr) -> Result<Vec<f32>> {
                 return Err(DataFusionError::Execution("Empty query vector".into()));
             }
             let inner = arr.value(0);
-            if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
-                return Ok(f32a.values().to_vec());
-            }
             if let Some(f64a) = inner.as_any().downcast_ref::<Float64Array>() {
-                return Ok(f64a.values().iter().map(|&v| v as f32).collect());
+                return Ok(f64a.values().to_vec());
+            }
+            if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
+                return Ok(f32a.values().iter().map(|&v| v as f64).collect());
             }
             Err(DataFusionError::Execution(
                 "List scalar inner is not Float32/Float64".into(),
@@ -349,10 +348,10 @@ fn extract_f32_vec(expr: &Expr) -> Result<Vec<f32>> {
             let mut result = Vec::with_capacity(sf.args.len());
             for arg in &sf.args {
                 match arg {
-                    Expr::Literal(ScalarValue::Float64(Some(v)), _) => result.push(*v as f32),
-                    Expr::Literal(ScalarValue::Float32(Some(v)), _) => result.push(*v),
-                    Expr::Literal(ScalarValue::Int64(Some(v)), _) => result.push(*v as f32),
-                    Expr::Literal(ScalarValue::Int32(Some(v)), _) => result.push(*v as f32),
+                    Expr::Literal(ScalarValue::Float64(Some(v)), _) => result.push(*v),
+                    Expr::Literal(ScalarValue::Float32(Some(v)), _) => result.push(*v as f64),
+                    Expr::Literal(ScalarValue::Int64(Some(v)), _) => result.push(*v as f64),
+                    Expr::Literal(ScalarValue::Int32(Some(v)), _) => result.push(*v as f64),
                     other => {
                         return Err(DataFusionError::Execution(format!(
                             "Non-literal in ARRAY[...]: {other:?}"
@@ -363,7 +362,7 @@ fn extract_f32_vec(expr: &Expr) -> Result<Vec<f32>> {
             Ok(result)
         }
         other => Err(DataFusionError::Execution(format!(
-            "Cannot extract f32 vector from: {other:?}"
+            "Cannot extract f64 vector from: {other:?}"
         ))),
     }
 }

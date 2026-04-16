@@ -937,3 +937,93 @@ async fn udf_dimension_mismatch_select_star() {
         "expected dimension mismatch error, got: {msg}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// vector_search_vector UDTF tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Basic happy path: returns correct rows with _distance column.
+#[tokio::test]
+async fn udtf_vector_search_vector_basic() {
+    let ctx = make_exec_ctx("conn::schema::items::vector").await;
+    let sql = "SELECT id, label, _distance FROM vector_search_vector('conn.schema.items', 'vector', ARRAY[1.0::float, 0.0::float, 0.0::float, 0.0::float], 3) ORDER BY _distance ASC";
+    let df = ctx.sql(sql).await.expect("sql");
+    let batches = df.collect().await.expect("collect");
+
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3, "expected 3 results");
+
+    // First result should be row 1 (exact match, distance 0)
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("id col");
+    assert_eq!(ids.value(0), 1, "closest must be row 1");
+
+    let dists = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("_distance col");
+    assert!(
+        (dists.value(0) - 0.0).abs() < 1e-6,
+        "row 1 distance must be 0.0, got {}",
+        dists.value(0)
+    );
+}
+
+/// Projection pushdown: only requested columns are returned.
+#[tokio::test]
+async fn udtf_vector_search_vector_projection() {
+    let ctx = make_exec_ctx("conn::schema::items::vector").await;
+    let sql = "SELECT id, _distance FROM vector_search_vector('conn.schema.items', 'vector', ARRAY[1.0::float, 0.0::float, 0.0::float, 0.0::float], 2)";
+    let df = ctx.sql(sql).await.expect("sql");
+    let batches = df.collect().await.expect("collect");
+    assert_eq!(
+        batches[0].num_columns(),
+        2,
+        "expected 2 columns (id, _distance), got {}",
+        batches[0].num_columns()
+    );
+    let schema = batches[0].schema();
+    let col_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(col_names, vec!["id", "_distance"]);
+}
+
+/// parse_dot_table_ref error: fewer than 3 parts.
+#[tokio::test]
+async fn udtf_vector_search_vector_bad_table_ref() {
+    let ctx = make_exec_ctx("conn::schema::items::vector").await;
+    let sql = "SELECT * FROM vector_search_vector('items', 'vector', ARRAY[1.0::float, 0.0::float, 0.0::float, 0.0::float], 3)";
+    let err = ctx.sql(sql).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("connection.schema.table"),
+        "expected table ref format error, got: {msg}"
+    );
+}
+
+/// Registry miss: column not in registry returns clear error.
+#[tokio::test]
+async fn udtf_vector_search_vector_registry_miss() {
+    let ctx = make_exec_ctx("conn::schema::items::vector").await;
+    let sql = "SELECT * FROM vector_search_vector('conn.schema.items', 'nonexistent', ARRAY[1.0::float, 0.0::float, 0.0::float, 0.0::float], 3)";
+    let err = ctx.sql(sql).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no loaded vector index"),
+        "expected registry miss error, got: {msg}"
+    );
+}
+
+/// Empty result: search with k larger than dataset returns all rows.
+#[tokio::test]
+async fn udtf_vector_search_vector_k_larger_than_dataset() {
+    let ctx = make_exec_ctx("conn::schema::items::vector").await;
+    let sql = "SELECT id, _distance FROM vector_search_vector('conn.schema.items', 'vector', ARRAY[1.0::float, 0.0::float, 0.0::float, 0.0::float], 100)";
+    let df = ctx.sql(sql).await.expect("sql");
+    let batches = df.collect().await.expect("collect");
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 4, "expected all 4 rows when k > dataset size");
+}
