@@ -3,8 +3,7 @@
 // Each takes (vector_col: FixedSizeList<Float32>, query: Array/Scalar) and
 // returns a Float32 distance per row.
 //
-// These are identical to the vector_search UDFs but kept in this module so
-// vector_usearch is fully self-contained (no dependency on vector_search).
+// These are kept in this module alongside the UDTF and optimizer rule.
 
 use std::any::Any;
 use std::hash::{Hash, Hasher};
