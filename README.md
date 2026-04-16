@@ -144,17 +144,31 @@ See [Adaptive filtering](#adaptive-filtering) for details on how the execution p
 
 ### UDTF path
 
-For runtime query vectors, complex joins, or explicit over-fetch control:
+`vector_search_vector` provides an explicit table function for ANN search, returning all table columns plus `_distance`:
 
 ```sql
-SELECT vs.key, vs._distance, d.title
-FROM vector_usearch('my_table', ARRAY[0.1, 0.2, ...], 20) vs
-JOIN my_table d ON d.id = vs.key
-ORDER BY vs._distance ASC
-LIMIT 10
+SELECT id, title, _distance
+FROM vector_search_vector('conn.schema.table', 'column', ARRAY[0.1, 0.2, ...], 10)
+ORDER BY _distance ASC
 ```
 
-The UDTF always calls `index.search()` directly — no filter absorption. Apply `WHERE` on the outer query to post-filter.
+| Argument | Type | Description |
+|---|---|---|
+| table | string literal | Dot-separated table reference: `'conn.schema.table'` |
+| column | string literal | Vector column with a registered index |
+| query | `ARRAY[...]` literal | Query vector |
+| k | integer | Number of nearest neighbors to return |
+
+The UDTF calls `resolve()` (sync, cache-only) on the registry — the index must already be loaded before the query is planned. It always calls `index.search()` directly — no filter absorption. Apply `WHERE` on the outer query to post-filter.
+
+```sql
+-- With filtering, aggregation, etc.
+SELECT category, COUNT(*) AS cnt, AVG(_distance) AS avg_dist
+FROM vector_search_vector('conn.schema.table', 'embedding', ARRAY[...], 50)
+WHERE category = 'nlp'
+GROUP BY category
+ORDER BY avg_dist
+```
 
 ### Tuning
 
@@ -205,7 +219,7 @@ src/
   rule.rs      — USearchRule: optimizer rewrite rule
   planner.rs   — USearchExecPlanner, USearchExec: physical execution
   udf.rs       — l2_distance, cosine_distance, negative_dot_product scalar UDFs
-  udtf.rs      — vector_usearch table function
+  udtf.rs      — vector_search_vector table function
   lookup.rs    — PointLookupProvider trait + HashKeyProvider
   keys.rs      — DatasetLayout, pack_key/unpack_key key encoding
 
@@ -292,6 +306,6 @@ Tests cover optimizer rule matching/rejection, end-to-end execution through both
 | Limitation | Notes |
 |---|---|
 | Stacked `Filter` nodes | Only one `Filter -> TableScan` layer is absorbed. `Filter -> Filter -> TableScan` falls back to exact execution. DataFusion typically combines multiple WHERE conditions into a single Filter, so this rarely occurs. |
-| Runtime query vectors | The query vector must be a compile-time literal (`ARRAY[0.1, ...]`). Column references or subquery results are not rewritten. Use the UDTF path for runtime vectors. |
+| Runtime query vectors | The query vector must be a compile-time literal (`ARRAY[0.1, ...]`). Column references or subquery results are not rewritten. Use `vector_search_vector` for explicit ANN queries. |
 | `ef_search` per-query | `expansion_search` is global to the index instance. Per-query adjustment is not supported. |
 | No DELETE / compaction | USearch soft-deletes entries but requires a full rebuild to reclaim space. |
