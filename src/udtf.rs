@@ -204,17 +204,17 @@ impl TableProvider for VectorSearchVectorProvider {
 struct BatchExec {
     schema: SchemaRef,
     batches: Arc<Vec<RecordBatch>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl BatchExec {
     fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             schema,
             batches: Arc::new(batches),
@@ -236,7 +236,7 @@ impl ExecutionPlan for BatchExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
