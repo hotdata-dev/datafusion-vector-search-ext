@@ -80,7 +80,7 @@ pub use registry::{
 };
 pub use rule::USearchRule;
 pub use udf::{cosine_distance_udf, l2_distance_udf, negative_dot_product_udf};
-pub use udtf::USearchUDTF;
+pub use udtf::VectorSearchVectorUDTF;
 
 #[cfg(feature = "parquet-provider")]
 pub use parquet_provider::ParquetLookupProvider;
@@ -99,7 +99,8 @@ use datafusion::prelude::SessionContext;
 /// - `l2_distance(col, query)`          — squared Euclidean distance (L2sq)
 /// - `cosine_distance(col, query)`      — cosine distance
 /// - `negative_dot_product(col, query)` — negated inner product
-/// - `vector_usearch(table, query, k)`  — explicit ANN table function
+/// - `vector_search_vector('conn.schema.table', 'column', ARRAY[...], k)`
+///   — explicit ANN table function returning full rows + `_distance`
 ///   (cache-only for async-backed resolvers; does not trigger async loads)
 /// - [`USearchRule`]                    — optimizer rewrite rule
 ///
@@ -110,10 +111,8 @@ pub fn register_all(ctx: &SessionContext, registry: Arc<dyn VectorIndexResolver>
     ctx.register_udf(ScalarUDF::new_from_impl(cosine_distance_udf()));
     ctx.register_udf(ScalarUDF::new_from_impl(negative_dot_product_udf()));
     ctx.register_udtf(
-        "vector_usearch",
-        // `vector_usearch()` is synchronous and therefore cache-only for
-        // async-backed resolvers.
-        Arc::new(USearchUDTF::new(registry.clone())),
+        "vector_search_vector",
+        Arc::new(VectorSearchVectorUDTF::new(registry.clone())),
     );
     ctx.add_optimizer_rule(Arc::new(USearchRule::new(registry)));
     Ok(())

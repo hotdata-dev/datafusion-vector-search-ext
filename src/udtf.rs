@@ -1,106 +1,90 @@
-// udtf.rs — USearchUDTF: explicit SQL table function interface.
+// udtf.rs — vector_search_vector: explicit SQL table function for ANN search.
 //
 // Usage:
-//   SELECT key, _distance FROM vector_usearch('table', ARRAY[...], k)
-//   SELECT key, _distance FROM vector_usearch('table', ARRAY[...], k, ef_search)
+//   SELECT * FROM vector_search_vector('conn.schema.table', 'column', ARRAY[...], k)
 //
-// Returns two columns only: `key: UInt64` and `_distance: Float32`.
-// To get full row data, JOIN the result against the data table:
-//
-//   SELECT d.id, d.name, vs._distance
-//   FROM vector_usearch('items', ARRAY[...], 10) vs
-//   JOIN items d ON d.id = vs.key
-//   ORDER BY vs._distance
+// Returns all table columns plus `_distance: Float32`.
+// Requires a vector index on the specified column.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_array::{Array, Float32Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_array::Array;
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
-use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
 
-use crate::registry::VectorIndexResolver;
+use crate::planner::{attach_distances, provider_key_col_idx, usearch_search};
+use crate::registry::{RegisteredTable, VectorIndexResolver};
 
 // ── UDTF ─────────────────────────────────────────────────────────────────────
 
-/// Table function:  vector_usearch(table_name, query_vec, k [, ef_search])
+/// Table function: vector_search_vector('conn.schema.table', 'column', ARRAY[...], k)
 ///
-/// Returns `(key: UInt64, _distance: Float32)`. Join with your data table on
-/// the key column to retrieve full rows.
+/// Returns all table columns plus `_distance: Float32`.
 ///
-/// This entry point is synchronous. For async-backed [`VectorIndexResolver`]
-/// implementations, it only works when the target index is already loaded in
-/// the local cache. `vector_usearch()` does not call `prepare()` and cannot
-/// trigger async index loads.
-pub struct USearchUDTF {
+/// This entry point is synchronous. It calls `resolve()` (cache-only) on the
+/// registry, so the index must already be loaded (e.g. via `refresh_for_tables`
+/// before planning). If the index is not cached, the function returns an error.
+pub struct VectorSearchVectorUDTF {
     registry: Arc<dyn VectorIndexResolver>,
 }
 
-impl fmt::Debug for USearchProvider {
+impl fmt::Debug for VectorSearchVectorUDTF {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "USearchProvider({})", self.table_name)
+        write!(f, "VectorSearchVectorUDTF")
     }
 }
 
-impl fmt::Debug for USearchUDTF {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "USearchUDTF")
-    }
-}
-
-impl USearchUDTF {
+impl VectorSearchVectorUDTF {
     pub fn new(registry: Arc<dyn VectorIndexResolver>) -> Self {
         Self { registry }
     }
 }
 
-impl TableFunctionImpl for USearchUDTF {
+impl TableFunctionImpl for VectorSearchVectorUDTF {
     fn call(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
-        if exprs.len() < 3 {
-            return Err(DataFusionError::Execution(
-                "vector_usearch requires at least 3 args: (table, query_vec, k)".into(),
+        if exprs.len() != 4 {
+            return Err(DataFusionError::Plan(
+                "vector_search_vector requires 4 arguments: \
+                 vector_search_vector('conn.schema.table', 'column', ARRAY[...], k)"
+                    .into(),
             ));
         }
 
-        let table_name = extract_string_literal(&exprs[0])?;
-        let query_vec = extract_f32_vec(&exprs[1])?;
-        let k = extract_usize_literal(&exprs[2])?;
+        let table_ref = extract_string_literal(&exprs[0])?;
+        let column = extract_string_literal(&exprs[1])?;
+        let query_vec = extract_f64_vec(&exprs[2])?;
+        let k = extract_usize_literal(&exprs[3])?;
 
-        // Optional ef_search — used as a hint for the search expansion width.
-        // NOTE: changing ef_search on a shared Arc<Index> affects all concurrent
-        // queries. For production use, maintain separate index instances per
-        // query, or set ef_search at load time.
-        let _ef_search: Option<usize> = if exprs.len() > 3 {
-            Some(extract_usize_literal(&exprs[3])?)
-        } else {
-            None
-        };
+        // Build the registry key: "conn::schema::table::column"
+        let (conn, schema, table) = parse_dot_table_ref(&table_ref)?;
+        let reg_key = format!("{conn}::{schema}::{table}::{column}");
 
-        let registered = self.registry.resolve(&table_name).ok_or_else(|| {
+        let registered = self.registry.resolve(&reg_key).ok_or_else(|| {
             DataFusionError::Execution(format!(
-                "vector_usearch: table '{table_name}' is not loaded locally. \
-This synchronous path only checks the local cache and cannot trigger async \
-loads. Use the optimizer/planner vector query path or pre-load the index first."
+                "vector_search_vector: no loaded vector index for '{reg_key}'. \
+                 Ensure the table is synced and has a vector index on column '{column}'."
             ))
         })?;
 
-        Ok(Arc::new(USearchProvider {
-            index: registered.index.clone(),
-            table_name,
+        Ok(Arc::new(VectorSearchVectorProvider {
+            registered,
             query_vec,
             k,
         }))
@@ -110,33 +94,32 @@ loads. Use the optimizer/planner vector query path or pre-load the index first."
 // ── TableProvider ─────────────────────────────────────────────────────────────
 
 /// TableProvider returned by the UDTF. Executes a USearch ANN query in scan(),
-/// returning only `(key: UInt64, _distance: Float32)`.
-struct USearchProvider {
-    index: Arc<usearch::Index>,
-    table_name: String,
-    query_vec: Vec<f32>,
+/// fetches full rows via the lookup provider, and appends `_distance`.
+struct VectorSearchVectorProvider {
+    registered: Arc<RegisteredTable>,
+    query_vec: Vec<f64>,
     k: usize,
 }
 
-fn udtf_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("key", DataType::UInt64, false),
-        Field::new("_distance", DataType::Float32, true),
-    ]))
+impl fmt::Debug for VectorSearchVectorProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "VectorSearchVectorProvider(k={})", self.k)
+    }
 }
 
 #[async_trait]
-impl TableProvider for USearchProvider {
+impl TableProvider for VectorSearchVectorProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn schema(&self) -> SchemaRef {
-        udtf_schema()
+        // RegisteredTable.schema already includes all data columns + _distance
+        self.registered.schema.clone()
     }
 
     fn table_type(&self) -> TableType {
-        TableType::Base
+        TableType::Temporary
     }
 
     async fn scan(
@@ -145,33 +128,70 @@ impl TableProvider for USearchProvider {
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
-    ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        let matches = self
-            .index
-            .search(&self.query_vec, self.k)
-            .map_err(|e| DataFusionError::Execution(format!("USearch search error: {e}")))?;
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // 1. HNSW search
+        let matches = usearch_search(
+            &self.registered.index,
+            &self.query_vec,
+            self.k,
+            self.registered.scalar_kind,
+        )?;
 
-        let schema = udtf_schema();
+        if matches.keys.is_empty() {
+            let schema = match projection {
+                Some(indices) => Arc::new(
+                    self.registered
+                        .schema
+                        .project(indices)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
+                ),
+                None => self.registered.schema.clone(),
+            };
+            return Ok(Arc::new(BatchExec::new(schema, vec![])));
+        }
 
-        let keys = UInt64Array::from(matches.keys.clone());
-        let dists = Float32Array::from(matches.distances.clone());
+        // 2. Build key → distance map
+        let key_to_dist: HashMap<u64, f32> = matches
+            .keys
+            .iter()
+            .zip(matches.distances.iter())
+            .map(|(&k, &d)| (k, d))
+            .collect();
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(keys), Arc::new(dists)])
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        // 3. Fetch full rows from lookup provider
+        let data_batches = self
+            .registered
+            .lookup_provider
+            .fetch_by_keys(&matches.keys, &self.registered.key_col, None)
+            .await?;
 
-        // Apply column projection so DataFusion's JOIN column indices are correct.
+        // 4. Attach _distance column
+        let key_col_idx = provider_key_col_idx(&self.registered)?;
+        let result_batches = attach_distances(
+            data_batches,
+            key_col_idx,
+            &key_to_dist,
+            &self.registered.schema,
+        )?;
+
+        // 5. Apply projection if needed
         let (proj_schema, proj_batches) = if let Some(indices) = projection {
             let ps = Arc::new(
-                schema
+                self.registered
+                    .schema
                     .project(indices)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
             );
-            let pb = batch
-                .project(indices)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            (ps, vec![pb])
+            let pb: Vec<RecordBatch> = result_batches
+                .into_iter()
+                .map(|b| {
+                    b.project(indices)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                })
+                .collect::<Result<_>>()?;
+            (ps, pb)
         } else {
-            (schema, vec![batch])
+            (self.registered.schema.clone(), result_batches)
         };
 
         Ok(Arc::new(BatchExec::new(proj_schema, proj_batches)))
@@ -249,9 +269,24 @@ impl ExecutionPlan for BatchExec {
     }
 }
 
-// ── Literal extraction helpers ────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
-// DataFusion 51: Expr::Literal is a 2-tuple (ScalarValue, Option<FieldMetadata>).
+/// Parse a dot-separated table reference: "conn.schema.table" → ("conn", "schema", "table")
+fn parse_dot_table_ref(s: &str) -> Result<(String, String, String)> {
+    let parts: Vec<&str> = s.splitn(3, '.').collect();
+    if parts.len() != 3 {
+        return Err(DataFusionError::Plan(format!(
+            "Expected 'connection.schema.table', got '{s}'"
+        )));
+    }
+    Ok((
+        parts[0].to_string(),
+        parts[1].to_string(),
+        parts[2].to_string(),
+    ))
+}
+
+// DataFusion 51+: Expr::Literal is a 2-tuple (ScalarValue, Option<FieldMetadata>).
 
 fn extract_string_literal(expr: &Expr) -> Result<String> {
     match expr {
@@ -275,7 +310,7 @@ fn extract_usize_literal(expr: &Expr) -> Result<usize> {
     }
 }
 
-fn extract_f32_vec(expr: &Expr) -> Result<Vec<f32>> {
+fn extract_f64_vec(expr: &Expr) -> Result<Vec<f64>> {
     use arrow_array::{Float32Array, Float64Array};
 
     match expr {
@@ -284,11 +319,11 @@ fn extract_f32_vec(expr: &Expr) -> Result<Vec<f32>> {
                 return Err(DataFusionError::Execution("Empty query vector".into()));
             }
             let inner = arr.value(0);
-            if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
-                return Ok(f32a.values().to_vec());
-            }
             if let Some(f64a) = inner.as_any().downcast_ref::<Float64Array>() {
-                return Ok(f64a.values().iter().map(|&v| v as f32).collect());
+                return Ok(f64a.values().to_vec());
+            }
+            if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
+                return Ok(f32a.values().iter().map(|&v| v as f64).collect());
             }
             Err(DataFusionError::Execution(
                 "FixedSizeList inner is not Float32/Float64".into(),
@@ -299,11 +334,11 @@ fn extract_f32_vec(expr: &Expr) -> Result<Vec<f32>> {
                 return Err(DataFusionError::Execution("Empty query vector".into()));
             }
             let inner = arr.value(0);
-            if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
-                return Ok(f32a.values().to_vec());
-            }
             if let Some(f64a) = inner.as_any().downcast_ref::<Float64Array>() {
-                return Ok(f64a.values().iter().map(|&v| v as f32).collect());
+                return Ok(f64a.values().to_vec());
+            }
+            if let Some(f32a) = inner.as_any().downcast_ref::<Float32Array>() {
+                return Ok(f32a.values().iter().map(|&v| v as f64).collect());
             }
             Err(DataFusionError::Execution(
                 "List scalar inner is not Float32/Float64".into(),
@@ -313,10 +348,10 @@ fn extract_f32_vec(expr: &Expr) -> Result<Vec<f32>> {
             let mut result = Vec::with_capacity(sf.args.len());
             for arg in &sf.args {
                 match arg {
-                    Expr::Literal(ScalarValue::Float64(Some(v)), _) => result.push(*v as f32),
-                    Expr::Literal(ScalarValue::Float32(Some(v)), _) => result.push(*v),
-                    Expr::Literal(ScalarValue::Int64(Some(v)), _) => result.push(*v as f32),
-                    Expr::Literal(ScalarValue::Int32(Some(v)), _) => result.push(*v as f32),
+                    Expr::Literal(ScalarValue::Float64(Some(v)), _) => result.push(*v),
+                    Expr::Literal(ScalarValue::Float32(Some(v)), _) => result.push(*v as f64),
+                    Expr::Literal(ScalarValue::Int64(Some(v)), _) => result.push(*v as f64),
+                    Expr::Literal(ScalarValue::Int32(Some(v)), _) => result.push(*v as f64),
                     other => {
                         return Err(DataFusionError::Execution(format!(
                             "Non-literal in ARRAY[...]: {other:?}"
@@ -327,7 +362,7 @@ fn extract_f32_vec(expr: &Expr) -> Result<Vec<f32>> {
             Ok(result)
         }
         other => Err(DataFusionError::Execution(format!(
-            "Cannot extract f32 vector from: {other:?}"
+            "Cannot extract f64 vector from: {other:?}"
         ))),
     }
 }
