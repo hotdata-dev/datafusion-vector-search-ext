@@ -11,18 +11,18 @@ sqlite-provider  = ["dep:rusqlite", "dep:serde_json", "dep:parquet"]
 
 [dependencies]
 tracing      = "0.1"
-datafusion   = "52.2.0"
+datafusion   = "53"
 usearch      = "2.24.0"
-arrow-array  = "57.2.0"
-arrow-schema = "57.2.0"
+arrow-array  = "58"
+arrow-schema = "58"
 async-trait  = "0.1"
 futures      = "0.3"
 # "sync" adds tokio::sync::Semaphore, used by SqliteLookupProvider's connection pool
 tokio        = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 
 # parquet-provider
-parquet      = { version = "57.2.0", optional = true, features = ["async", "object_store"] }
-object_store = { version = "0.12",   optional = true }
+parquet      = { version = "58", optional = true, features = ["async", "object_store"] }
+object_store = { version = "0.13",   optional = true }
 bytes        = { version = "1",      optional = true }
 
 # sqlite-provider
