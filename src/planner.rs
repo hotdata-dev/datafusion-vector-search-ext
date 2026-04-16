@@ -616,7 +616,7 @@ async fn adaptive_filtered_execute(
 
 /// Call `index.search` with the native scalar type appropriate for the column.
 /// Converts the usearch error into a `DataFusionError::Execution`.
-fn usearch_search(
+pub(crate) fn usearch_search(
     index: &usearch::Index,
     query_f64: &[f64],
     k: usize,
@@ -797,7 +797,7 @@ fn compute_raw_distance_f64(v: &[f64], q: &[f64], dist_type: &DistanceType) -> f
 /// Extract the distance from a single row of a vector column.
 ///
 /// Index of the key column in the lookup provider schema.
-fn provider_key_col_idx(registered: &crate::registry::RegisteredTable) -> Result<usize> {
+pub(crate) fn provider_key_col_idx(registered: &crate::registry::RegisteredTable) -> Result<usize> {
     registered
         .lookup_provider
         .schema()
@@ -813,7 +813,7 @@ fn provider_key_col_idx(registered: &crate::registry::RegisteredTable) -> Result
 // ── Distance attachment ───────────────────────────────────────────────────────
 
 /// Append a `_distance: Float32` column to each batch.
-fn attach_distances(
+pub(crate) fn attach_distances(
     batches: Vec<RecordBatch>,
     key_col_idx: usize,
     key_to_dist: &HashMap<u64, f32>,
