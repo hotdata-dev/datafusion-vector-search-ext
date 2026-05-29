@@ -161,6 +161,134 @@ async fn test_stream_builder_with_explicit_rowid_keys() {
     assert_eq!(empty.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
 }
 
+#[test]
+fn test_stream_builder_abandon_rolls_back() {
+    // Dropping the builder before finish() must roll the transaction back, so
+    // the table is never persisted. We prove it by re-running begin() on the
+    // same path: its CREATE TABLE only succeeds if the abandoned build left no
+    // table behind.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("abandon.db");
+    let db = db_path.to_str().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2])),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+        ],
+    )
+    .unwrap();
+
+    {
+        let mut builder =
+            SqliteSidecarBuilder::begin(db, "models", 1, schema.clone(), 0, vec![1]).unwrap();
+        builder.push_batch(&batch).unwrap();
+        // builder dropped here without finish() → rollback
+    }
+
+    // A fresh build on the same path must succeed (table does not already exist).
+    assert!(
+        SqliteSidecarBuilder::begin(db, "models", 1, schema, 0, vec![1]).is_ok(),
+        "abandoned build must not persist its table"
+    );
+}
+
+#[tokio::test]
+async fn test_stream_builder_uint64_keys() {
+    // The key column may be UInt64 (as well as Int64); it is stored as SQLite
+    // INTEGER and looked up via the u64 fetch API.
+    let dir = tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::UInt64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![7_u64, 11])),
+            Arc::new(StringArray::from(vec![Some("x"), Some("y")])),
+        ],
+    )
+    .unwrap();
+    let db_path = dir.path().join("u64.db");
+    let mut builder =
+        SqliteSidecarBuilder::begin(db_path.to_str().unwrap(), "t", 2, schema, 0, vec![1]).unwrap();
+    builder.push_batch(&batch).unwrap();
+    let provider = builder.finish().unwrap();
+
+    let batches = provider.fetch_by_keys(&[11], "rowid", None).await.unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+}
+
+#[test]
+fn test_stream_builder_validation_errors() {
+    let dir = tempdir().unwrap();
+    let db = |n: &str| dir.path().join(n).to_str().unwrap().to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+
+    // pool_size must be >= 1.
+    assert!(SqliteSidecarBuilder::begin(&db("a.db"), "t", 0, schema.clone(), 0, vec![1]).is_err());
+
+    // schema has 2 fields → exactly 1 value column index expected, not 2.
+    assert!(
+        SqliteSidecarBuilder::begin(&db("b.db"), "t", 1, schema.clone(), 0, vec![1, 2]).is_err()
+    );
+
+    // key_col_index out of range for the pushed batch (2 columns, index 9).
+    let mut b_oob =
+        SqliteSidecarBuilder::begin(&db("c.db"), "t", 1, schema.clone(), 9, vec![1]).unwrap();
+    let two_col = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64])),
+            Arc::new(StringArray::from(vec![Some("a")])),
+        ],
+    )
+    .unwrap();
+    assert!(b_oob.push_batch(&two_col).is_err());
+
+    // A null key value is rejected.
+    let nullable = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let mut b_null =
+        SqliteSidecarBuilder::begin(&db("d.db"), "t", 1, nullable.clone(), 0, vec![1]).unwrap();
+    let null_key = RecordBatch::try_new(
+        nullable,
+        vec![
+            Arc::new(Int64Array::from(vec![None, Some(2)])),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+        ],
+    )
+    .unwrap();
+    assert!(b_null.push_batch(&null_key).is_err());
+
+    // A non-integer key column type is rejected.
+    let text_key = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let mut b_text =
+        SqliteSidecarBuilder::begin(&db("e.db"), "t", 1, text_key.clone(), 0, vec![1]).unwrap();
+    let text_batch = RecordBatch::try_new(
+        text_key,
+        vec![
+            Arc::new(StringArray::from(vec![Some("k")])),
+            Arc::new(StringArray::from(vec![Some("a")])),
+        ],
+    )
+    .unwrap();
+    assert!(b_text.push_batch(&text_batch).is_err());
+}
+
 #[tokio::test]
 async fn test_projection() {
     let dir = tempdir().unwrap();
