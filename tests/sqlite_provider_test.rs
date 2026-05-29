@@ -254,6 +254,11 @@ fn test_stream_builder_validation_errors() {
     .unwrap();
     assert!(b_oob.push_batch(&two_col).is_err());
 
+    // value_col_index out of range for the pushed batch (clean error, no panic).
+    let mut b_voob =
+        SqliteSidecarBuilder::begin(&db("c2.db"), "t", 1, schema.clone(), 0, vec![9]).unwrap();
+    assert!(b_voob.push_batch(&two_col).is_err());
+
     // A null key value is rejected.
     let nullable = Arc::new(Schema::new(vec![
         Field::new("rowid", DataType::Int64, true),

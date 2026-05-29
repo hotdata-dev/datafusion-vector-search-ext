@@ -366,6 +366,11 @@ impl SqliteSidecarBuilder {
                 self.key_col_index
             )));
         }
+        if let Some(&bad) = self.value_col_indices.iter().find(|&&i| i >= ncols) {
+            return Err(DataFusionError::Execution(format!(
+                "value column index {bad} out of range for batch with {ncols} columns"
+            )));
+        }
         let key_col = batch.column(self.key_col_index);
         let mut stmt = self
             .conn
