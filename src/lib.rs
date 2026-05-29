@@ -85,7 +85,7 @@ pub use udtf::VectorSearchVectorUDTF;
 #[cfg(feature = "parquet-provider")]
 pub use parquet_provider::ParquetLookupProvider;
 #[cfg(feature = "sqlite-provider")]
-pub use sqlite_provider::SqliteLookupProvider;
+pub use sqlite_provider::{SqliteLookupProvider, SqliteSidecarBuilder};
 
 use std::sync::Arc;
 
