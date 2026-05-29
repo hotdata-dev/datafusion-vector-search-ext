@@ -2,11 +2,13 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::catalog::TableProvider;
 use datafusion::prelude::SessionContext;
-use datafusion_vector_search_ext::{PointLookupProvider, SqliteLookupProvider};
+use datafusion_vector_search_ext::{
+    PointLookupProvider, SqliteLookupProvider, SqliteSidecarBuilder,
+};
 use parquet::arrow::ArrowWriter;
 use tempfile::tempdir;
 
@@ -79,6 +81,84 @@ async fn test_fetch_existing_keys() {
     assert!(names.contains(&"alice".to_string()));
     assert!(names.contains(&"carol".to_string()));
     assert!(!names.contains(&"bob".to_string()));
+}
+
+#[tokio::test]
+async fn test_stream_builder_with_explicit_rowid_keys() {
+    // The streaming builder reads each row's key from a column (e.g. a storage
+    // engine's native rowid) instead of synthesising 0..N. Keys here are sparse
+    // and non-monotonic across two batches to prove that works end to end.
+    let dir = tempdir().unwrap();
+
+    let batch_schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    // Output schema: key column first, then the stored value column.
+    let provider_schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+
+    let b1 = RecordBatch::try_new(
+        batch_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![100_i64, 250])),
+            Arc::new(StringArray::from(vec![Some("alice"), Some("bob")])),
+        ],
+    )
+    .unwrap();
+    let b2 = RecordBatch::try_new(
+        batch_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![999_i64])),
+            Arc::new(StringArray::from(vec![Some("carol")])),
+        ],
+    )
+    .unwrap();
+
+    let db_path = dir.path().join("stream.db");
+    let mut builder = SqliteSidecarBuilder::begin(
+        db_path.to_str().unwrap(),
+        "models",
+        4,
+        provider_schema,
+        0,       // key (rowid) is column 0 of the input batches
+        vec![1], // input column 1 (name) → provider field 1
+    )
+    .unwrap();
+    builder.push_batch(&b1).unwrap();
+    builder.push_batch(&b2).unwrap();
+    let provider = builder.finish().unwrap();
+
+    // Point-lookup by sparse rowids.
+    let batches = provider
+        .fetch_by_keys(&[100, 999], "rowid", None)
+        .await
+        .unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2);
+
+    let names: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .collect();
+    assert!(names.contains(&"alice".to_string()));
+    assert!(names.contains(&"carol".to_string()));
+    assert!(!names.contains(&"bob".to_string())); // rowid 250 not requested
+
+    // A rowid that was never inserted returns nothing.
+    let empty = provider.fetch_by_keys(&[42], "rowid", None).await.unwrap();
+    assert_eq!(empty.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
 }
 
 #[tokio::test]
