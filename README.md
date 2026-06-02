@@ -4,7 +4,7 @@ A DataFusion extension that integrates [USearch](https://github.com/unum-cloud/u
 
 Queries matching the `ORDER BY distance_fn(col, query) LIMIT k` pattern are **transparently rewritten** by an optimizer rule into a native USearch index call — no query rewrite needed from the caller. `WHERE` clause filters are handled adaptively: high-selectivity filters use USearch's in-graph predicate API; low-selectivity filters bypass HNSW entirely and scan the data directly.
 
-**DataFusion:** 52.2 &nbsp; **USearch:** 2.24
+**DataFusion:** 53 &nbsp; **USearch:** 2.24
 
 ---
 
@@ -230,20 +230,33 @@ tests/
 
 ### Optimizer rewrite
 
-The rule (`rule.rs`) matches two logical plan shapes:
+The rule (`rule.rs`) matches the `Sort(fetch=k)` over a `TableScan`, with an
+optional `Projection` between them and an optional `Filter` directly above the
+scan:
 
 ```
 Sort(fetch=k, ORDER BY dist ASC)
-  Projection([..., distance_fn(col, lit) AS dist, ...])
-    TableScan(name)
-
-Sort(fetch=k, ORDER BY dist ASC)
-  Projection([..., distance_fn(col, lit) AS dist, ...])
-    Filter(predicate)
+  [ Projection([..., distance_fn(col, lit) AS dist, ...]) ]   ← optional
+    [ Filter(predicate) ]                                     ← optional
       TableScan(name)
 ```
 
-Preconditions: sort is `ASC`, distance UDF matches index metric, table is registered, query vector is a literal. When the rule fires, it replaces the inner nodes with a `USearchNode` leaf carrying: table name, vector column, query vector, k, distance type, and absorbed filter predicates. The `Sort` node is preserved above for final ordering.
+DataFusion omits the `Projection` for `SELECT *` (and for any SELECT whose
+columns come straight from the scan), so the `Sort` can sit directly on the
+`TableScan`.
+
+Preconditions: sort is `ASC`, distance UDF matches index metric, table is
+registered, query vector is a literal. When the rule fires, it replaces the inner
+nodes with a `USearchNode` leaf carrying: table name, vector column, query
+vector, k, distance type, and absorbed filter predicates. The `Sort` node is
+preserved above for final ordering.
+
+**Schema preservation:** an optimizer rule must not change the plan's output
+schema. The `USearchNode` produces only what the `lookup_provider` can fetch by
+key (addressing key + non-vector columns) plus `_distance` — it cannot produce
+the indexed vector column. If the matched `Sort`'s output would include the
+vector column (e.g. `SELECT *`), the rule declines and the query falls back to
+exact execution rather than emitting a schema-incompatible plan.
 
 Physical planning (`planner.rs`) translates `USearchNode` into `USearchExec`, a physical plan node that executes the actual search.
 
@@ -305,6 +318,7 @@ Tests cover optimizer rule matching/rejection, end-to-end execution through both
 
 | Limitation | Notes |
 |---|---|
+| Projecting the indexed vector column | A k-NN query whose output includes the vector column itself (e.g. `SELECT *`, or `SELECT id, vector`) falls back to exact execution. The `lookup_provider` does not store the vector column (see [registration](#register-providers-and-set-up-the-sessioncontext)), so the rewrite cannot reproduce it. Project the metadata columns and the distance instead. |
 | Stacked `Filter` nodes | Only one `Filter -> TableScan` layer is absorbed. `Filter -> Filter -> TableScan` falls back to exact execution. DataFusion typically combines multiple WHERE conditions into a single Filter, so this rarely occurs. |
 | Runtime query vectors | The query vector must be a compile-time literal (`ARRAY[0.1, ...]`). Column references or subquery results are not rewritten. Use `vector_search_vector` for explicit ANN queries. |
 | `ef_search` per-query | `expansion_search` is global to the index instance. Per-query adjustment is not supported. |

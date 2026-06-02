@@ -48,20 +48,65 @@ impl USearchRule {
     }
 
     fn try_match(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+        match plan {
+            // Anchor on the Sort itself. The projection (if any) sits *below* the
+            // Sort and supplies its output columns; SELECT * omits it entirely.
+            LogicalPlan::Sort(sort) => {
+                let (proj_exprs_slice, after_sort): (&[Expr], &LogicalPlan) =
+                    match sort.input.as_ref() {
+                        LogicalPlan::Projection(p) => (p.expr.as_slice(), p.input.as_ref()),
+                        other => (&[], other),
+                    };
+                self.build_rewrite(sort, proj_exprs_slice, after_sort)
+            }
+
+            // Output-aware passthrough. When a Projection sits directly over a
+            // k-NN Sort that rests on the scan (no projection between them), drive
+            // the rewrite with the OUTER projection's columns — i.e. the query's
+            // real output. The rewrite can only produce the index node's columns
+            // (addressing key + non-vector columns + _distance), never the indexed
+            // vector itself. Routing the output columns through `build_rewrite`
+            // lets it fire when they're all producible (e.g. `SELECT id … ORDER BY
+            // l2_distance(emb, …)`) and decline — falling back to exact search —
+            // when the output needs the vector (`SELECT *`, `SELECT id, emb`),
+            // rather than emitting a schema the consumer can't satisfy (issue #508).
+            //
+            // ALTERNATIVE (not taken): teach USearchExec to reconstruct the vector
+            // column for the result keys via `index.get(key)`, so even
+            // vector-returning queries stay on the index. Rejected to keep a single
+            // source of truth for returned vectors — the index would otherwise be a
+            // second source that must byte-match the parquet (breaks under F16
+            // quantization, and relies on USearch never transforming stored vectors).
+            // See the README "Limitations" entry and runtimedb issue #508.
+            LogicalPlan::Projection(outer) => {
+                let LogicalPlan::Sort(sort) = outer.input.as_ref() else {
+                    return None;
+                };
+                // Only the passthrough shape; the remap shape (projection *below*
+                // the Sort) is handled when we visit the Sort above.
+                if !matches!(
+                    sort.input.as_ref(),
+                    LogicalPlan::TableScan(_) | LogicalPlan::Filter(_)
+                ) {
+                    return None;
+                }
+                self.build_rewrite(sort, &outer.expr, sort.input.as_ref())
+            }
+
+            _ => None,
+        }
+    }
+
+    fn build_rewrite(
+        &self,
+        sort: &datafusion::logical_expr::logical_plan::Sort,
+        proj_exprs_slice: &[Expr],
+        after_sort: &LogicalPlan,
+    ) -> Option<LogicalPlan> {
         use datafusion::logical_expr::logical_plan::TableScan;
 
         // Require Sort with embedded fetch limit.
-        let sort = match plan {
-            LogicalPlan::Sort(s) => s,
-            _ => return None,
-        };
         let k = sort.fetch?;
-
-        // Projection is optional — DataFusion 51 omits it for SELECT * queries.
-        let (proj_exprs_slice, after_sort): (&[Expr], &LogicalPlan) = match sort.input.as_ref() {
-            LogicalPlan::Projection(p) => (p.expr.as_slice(), p.input.as_ref()),
-            other => (&[], other),
-        };
 
         // Accept TableScan directly, or Filter(TableScan) for WHERE clauses.
         // Deeper nesting (Filter→Filter→…) is not absorbed — the rule does
@@ -155,7 +200,14 @@ impl USearchRule {
         // Build the final user-visible projection over USearchNode output.
         let dist_alias_str = dist_alias.as_deref().unwrap_or("_distance");
         let final_proj_exprs = if proj_exprs_slice.is_empty() {
-            passthrough_projection(&vsn_df_schema, &table_ref)
+            // No explicit Projection node (e.g. SELECT *, or a SELECT whose
+            // columns come straight from the scan, so the Sort sits directly on
+            // the TableScan). The rewrite must reproduce the original output
+            // columns; if any isn't producible from the node — the indexed
+            // vector column is never stored in the fetch path — bail so the
+            // query falls back to exact brute-force search, like the other
+            // unsupported shapes (DESC, metric mismatch, stacked filters).
+            passthrough_projection(after_sort.schema().as_ref(), &vsn_df_schema, &table_ref)?
         } else {
             remap_projections(proj_exprs_slice, dist_alias_str, &table_ref)
         };
@@ -375,21 +427,39 @@ fn build_outer_projection(exprs: &[Expr]) -> Vec<Expr> {
         .collect()
 }
 
-/// Build a passthrough Projection for SELECT * queries (no original Projection node).
-/// Projects only the original table columns (not `_distance`) so the output schema
-/// matches the original Sort schema. The Sort re-evaluates the distance UDF expression
-/// on the k result rows returned by USearchExec (O(k × dim), negligible for small k).
-fn passthrough_projection(schema: &DFSchema, table_ref: &TableReference) -> Vec<Expr> {
-    schema
+/// Build a passthrough Projection for queries with no explicit Projection node
+/// (e.g. `SELECT *`, or a SELECT whose columns come straight from the scan so the
+/// Sort sits directly on the TableScan).
+///
+/// The projection must reproduce the *original* output columns (`original_schema`,
+/// the Sort's input). The `USearchNode` can only produce the columns in
+/// `node_schema` — the fetch path's addressing key + non-vector columns +
+/// `_distance`; the indexed vector column is never stored there (see
+/// `PointLookupProvider`). If the original output needs a column the node can't
+/// produce (the vector column), return `None` so the rule declines to rewrite and
+/// the query falls back to exact brute-force search. The Sort re-evaluates the
+/// distance UDF on the k result rows returned by USearchExec (O(k × dim)).
+fn passthrough_projection(
+    original_schema: &DFSchema,
+    node_schema: &DFSchema,
+    table_ref: &TableReference,
+) -> Option<Vec<Expr>> {
+    original_schema
         .inner()
         .fields()
         .iter()
-        .filter(|f| f.name() != "_distance")
         .map(|f| {
-            Expr::Column(datafusion::common::Column::new(
-                Some(table_ref.clone()),
-                f.name().as_str(),
-            ))
+            let producible = node_schema
+                .inner()
+                .fields()
+                .iter()
+                .any(|nf| nf.name() == f.name());
+            producible.then(|| {
+                Expr::Column(datafusion::common::Column::new(
+                    Some(table_ref.clone()),
+                    f.name().as_str(),
+                ))
+            })
         })
         .collect()
 }
