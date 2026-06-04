@@ -11,6 +11,19 @@
 //       Filter(predicate)                      ← WHERE clause absorbed
 //         TableScan(name)
 //
+// Patterns matched (TopDown, Projection node):
+//
+//   Projection([output cols])                  ← SELECT list without the distance
+//     Sort(l2_distance(vector, lit), fetch=k)  ← distance inline in ORDER BY
+//       [Projection([output cols + vector])]   ← optional; DataFusion materializes
+//         [Filter(predicate)]                     the vector only to feed the Sort
+//           TableScan(name)
+//
+// In the Projection-anchored shape, producibility is judged on the OUTER
+// projection (the query's real output): `SELECT id … ORDER BY l2_distance(…)`
+// rewrites, while `SELECT *` / `SELECT id, vector` still fall back because the
+// node cannot produce the vector column (issue #508).
+//
 // When a Filter node is present its predicate is stored in USearchNode.filters.
 // The physical planner then runs adaptive filtered search:
 //   - high selectivity → usearch::Index::filtered_search (in-graph filtering)
@@ -82,15 +95,35 @@ impl USearchRule {
                 let LogicalPlan::Sort(sort) = outer.input.as_ref() else {
                     return None;
                 };
-                // Only the passthrough shape; the remap shape (projection *below*
-                // the Sort) is handled when we visit the Sort above.
-                if !matches!(
-                    sort.input.as_ref(),
-                    LogicalPlan::TableScan(_) | LogicalPlan::Filter(_)
-                ) {
-                    return None;
+                match sort.input.as_ref() {
+                    // Passthrough shape: Sort rests directly on the scan.
+                    LogicalPlan::TableScan(_) | LogicalPlan::Filter(_) => {
+                        self.build_rewrite(sort, &outer.expr, sort.input.as_ref())
+                    }
+                    // Trimmed shape: `SELECT id … ORDER BY l2_distance(vec, …)`
+                    // with the distance NOT in the SELECT list. DataFusion
+                    // materializes the raw vector column in an intermediate
+                    // projection purely to feed the Sort, then trims it with
+                    // this outer projection. Producibility must be judged on
+                    // the OUTER (real output) columns — the inner projection's
+                    // vector column never reaches the user. The Sort visit
+                    // would wrongly decline this shape (it sees the vector
+                    // among the inner projection's outputs and the node cannot
+                    // produce it). When the distance is instead aliased inside
+                    // the inner projection (`SELECT …, l2_distance(…) AS d …
+                    // ORDER BY d`), `find_distance_info` finds no distance in
+                    // the outer exprs, `build_rewrite` declines here, and the
+                    // Sort visit handles it exactly as before.
+                    LogicalPlan::Projection(inner)
+                        if matches!(
+                            inner.input.as_ref(),
+                            LogicalPlan::TableScan(_) | LogicalPlan::Filter(_)
+                        ) =>
+                    {
+                        self.build_rewrite(sort, &outer.expr, inner.input.as_ref())
+                    }
+                    _ => None,
                 }
-                self.build_rewrite(sort, &outer.expr, sort.input.as_ref())
             }
 
             _ => None,
