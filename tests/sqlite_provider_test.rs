@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    Array, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::catalog::TableProvider;
 use datafusion::prelude::SessionContext;
@@ -292,6 +294,84 @@ fn test_stream_builder_validation_errors() {
     )
     .unwrap();
     assert!(b_text.push_batch(&text_batch).is_err());
+}
+
+/// Regression test for hotdata-dev/runtimedb#631: payload columns typed as
+/// `LargeUtf8` (what DuckDB/parquet readers emit for strings) or `Utf8View`
+/// (what a `::text` cast produces) must round-trip through the sidecar. The
+/// write side already mapped both to TEXT, but the read-back path was missing
+/// the reconstruction arms and failed with "unsupported Arrow type LargeUtf8".
+#[tokio::test]
+async fn test_string_view_and_large_utf8_roundtrip() {
+    let dir = tempdir().unwrap();
+
+    // key + a LargeUtf8 column + a Utf8View column.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("large", DataType::LargeUtf8, true),
+        Field::new("view", DataType::Utf8View, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![10_i64, 20, 30])),
+            Arc::new(LargeStringArray::from(vec![
+                Some("alpha"),
+                None,
+                Some("gamma"),
+            ])),
+            Arc::new(StringViewArray::from(vec![Some("one"), Some("two"), None])),
+        ],
+    )
+    .unwrap();
+
+    let db_path = dir.path().join("strings.db");
+    let mut builder = SqliteSidecarBuilder::begin(
+        db_path.to_str().unwrap(),
+        "models",
+        2,
+        schema,
+        0,          // key (rowid) is column 0
+        vec![1, 2], // columns 1 (large) and 2 (view) are stored values
+    )
+    .unwrap();
+    builder.push_batch(&batch).unwrap();
+    let provider = builder.finish().unwrap();
+
+    let batches = provider
+        .fetch_by_keys(&[10, 30], "rowid", None)
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+    // The reconstructed columns must preserve their original Arrow types and values.
+    let mut large: Vec<Option<String>> = Vec::new();
+    let mut view: Vec<Option<String>> = Vec::new();
+    for b in &batches {
+        let l = b
+            .column_by_name("large")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("large column should reconstruct as LargeStringArray");
+        let v = b
+            .column_by_name("view")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("view column should reconstruct as StringViewArray");
+        for i in 0..b.num_rows() {
+            large.push(l.is_valid(i).then(|| l.value(i).to_string()));
+            view.push(v.is_valid(i).then(|| v.value(i).to_string()));
+        }
+    }
+
+    assert!(large.contains(&Some("alpha".to_string())));
+    assert!(large.contains(&Some("gamma".to_string())));
+    assert!(view.contains(&Some("one".to_string())));
+    // rowid 30 had a null view value, which must survive the round-trip.
+    assert!(view.contains(&None));
 }
 
 #[tokio::test]

@@ -17,7 +17,9 @@ use std::any::Any;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use arrow_array::builder::{Int32Builder, Int64Builder, ListBuilder, StringBuilder};
+use arrow_array::builder::{
+    Int32Builder, Int64Builder, LargeStringBuilder, ListBuilder, StringBuilder, StringViewBuilder,
+};
 use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     UInt32Array, UInt64Array,
@@ -1007,6 +1009,14 @@ fn arrow_cell_to_sql(col: &ArrayRef, row: usize) -> SqlValue {
                 .value(row);
             SqlValue::Text(v.to_string())
         }
+        DataType::Utf8View => {
+            let v = col
+                .as_any()
+                .downcast_ref::<arrow_array::StringViewArray>()
+                .unwrap()
+                .value(row);
+            SqlValue::Text(v.to_string())
+        }
         DataType::Int32 => SqlValue::Integer(
             col.as_any()
                 .downcast_ref::<Int32Array>()
@@ -1085,6 +1095,14 @@ fn serialize_list(col: &ArrayRef, row: usize) -> String {
                         .value(i);
                     JV::String(s.to_string())
                 }
+                DataType::Utf8View => {
+                    let s = list_val
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringViewArray>()
+                        .unwrap()
+                        .value(i);
+                    JV::String(s.to_string())
+                }
                 DataType::Int64 => {
                     let v = list_val
                         .as_any()
@@ -1153,6 +1171,26 @@ fn sql_values_to_arrow(dt: &DataType, values: Vec<SqlValue>) -> DFResult<ArrayRe
         }
         DataType::Utf8 => {
             let mut b = StringBuilder::with_capacity(values.len(), values.len() * 32);
+            for v in &values {
+                match v {
+                    SqlValue::Text(s) => b.append_value(s),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::LargeUtf8 => {
+            let mut b = LargeStringBuilder::with_capacity(values.len(), values.len() * 32);
+            for v in &values {
+                match v {
+                    SqlValue::Text(s) => b.append_value(s),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        DataType::Utf8View => {
+            let mut b = StringViewBuilder::with_capacity(values.len());
             for v in &values {
                 match v {
                     SqlValue::Text(s) => b.append_value(s),
