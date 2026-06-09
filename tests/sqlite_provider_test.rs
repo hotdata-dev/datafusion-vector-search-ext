@@ -486,6 +486,58 @@ async fn test_list_largeutf8_roundtrip() {
     assert!(strs.is_null(1));
 }
 
+/// A `LargeList<Utf8>` payload must round-trip. The write side serializes both
+/// `List` and `LargeList` to JSON TEXT, but the read-back path only reconstructed
+/// `List`, so a `LargeList` column failed with "unsupported Arrow type LargeList".
+#[tokio::test]
+async fn test_largelist_roundtrip() {
+    use arrow_array::LargeListArray;
+    use arrow_array::builder::{LargeListBuilder, StringBuilder};
+
+    let dir = tempdir().unwrap();
+
+    let item_field = Arc::new(Field::new("item", DataType::Utf8, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("tags", DataType::LargeList(item_field.clone()), true),
+    ]));
+
+    let mut lb = LargeListBuilder::new(StringBuilder::new()).with_field(item_field);
+    lb.values().append_value("red");
+    lb.values().append_null();
+    lb.append(true);
+    let tags = lb.finish();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1_i64])), Arc::new(tags)],
+    )
+    .unwrap();
+
+    let db_path = dir.path().join("largelist.db");
+    let mut builder =
+        SqliteSidecarBuilder::begin(db_path.to_str().unwrap(), "models", 2, schema, 0, vec![1])
+            .unwrap();
+    builder.push_batch(&batch).unwrap();
+    let provider = builder.finish().unwrap();
+
+    let batches = provider.fetch_by_keys(&[1], "rowid", None).await.unwrap();
+    let list = batches[0]
+        .column_by_name("tags")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<LargeListArray>()
+        .expect("tags should reconstruct as a LargeList");
+    let inner = list.value(0);
+    let strs = inner
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("list items should reconstruct as StringArray");
+    assert_eq!(strs.len(), 2);
+    assert_eq!(strs.value(0), "red");
+    assert!(strs.is_null(1));
+}
+
 #[tokio::test]
 async fn test_projection() {
     let dir = tempdir().unwrap();

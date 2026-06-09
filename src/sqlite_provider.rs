@@ -18,13 +18,14 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::builder::{
-    Int32Builder, Int64Builder, LargeStringBuilder, ListBuilder, StringBuilder, StringViewBuilder,
+    GenericListBuilder, Int32Builder, Int64Builder, LargeStringBuilder, StringBuilder,
+    StringViewBuilder,
 };
 use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, OffsetSizeTrait,
+    RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::{DataType, FieldRef, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result as DFResult;
@@ -1127,6 +1128,45 @@ fn serialize_list(col: &ArrayRef, row: usize) -> String {
     serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Reconstruct a `GenericListArray<O>` (regular `List` when `O = i32`,
+/// `LargeList` when `O = i64`) from the JSON TEXT that `serialize_list` writes.
+/// The serialized form is identical for both offset widths, so the only
+/// difference is the outer builder's offset type — hence the generic.
+fn json_text_to_list<O: OffsetSizeTrait>(
+    item_field: &FieldRef,
+    values: &[SqlValue],
+) -> DFResult<ArrayRef> {
+    macro_rules! build_list {
+        ($child:expr, $item:ty) => {{
+            let mut b =
+                GenericListBuilder::<O, _>::new($child).with_field(item_field.as_ref().clone());
+            for v in values {
+                match v {
+                    SqlValue::Text(s) => {
+                        let items: Vec<Option<$item>> = serde_json::from_str(s).unwrap_or_default();
+                        for item in items {
+                            b.values().append_option(item);
+                        }
+                        b.append(true);
+                    }
+                    _ => b.append(false),
+                }
+            }
+            Arc::new(b.finish()) as ArrayRef
+        }};
+    }
+    Ok(match item_field.data_type() {
+        DataType::Utf8 => build_list!(StringBuilder::new(), String),
+        DataType::LargeUtf8 => build_list!(LargeStringBuilder::new(), String),
+        DataType::Utf8View => build_list!(StringViewBuilder::new(), String),
+        DataType::Int64 => build_list!(Int64Builder::new(), i64),
+        DataType::Int32 => build_list!(Int32Builder::new(), i32),
+        inner => Err(DataFusionError::Execution(format!(
+            "SqliteLookupProvider: unsupported list item type {inner:?}"
+        )))?,
+    })
+}
+
 fn sql_values_to_arrow(dt: &DataType, values: Vec<SqlValue>) -> DFResult<ArrayRef> {
     Ok(match dt {
         DataType::UInt64 => {
@@ -1199,101 +1239,8 @@ fn sql_values_to_arrow(dt: &DataType, values: Vec<SqlValue>) -> DFResult<ArrayRe
             }
             Arc::new(b.finish())
         }
-        DataType::List(item_field) => match item_field.data_type() {
-            DataType::Utf8 => {
-                let mut b =
-                    ListBuilder::new(StringBuilder::new()).with_field(item_field.as_ref().clone());
-                for v in &values {
-                    match v {
-                        SqlValue::Text(s) => {
-                            let items: Vec<Option<String>> =
-                                serde_json::from_str(s).unwrap_or_default();
-                            for item in items {
-                                b.values().append_option(item);
-                            }
-                            b.append(true);
-                        }
-                        _ => b.append(false),
-                    }
-                }
-                Arc::new(b.finish())
-            }
-            DataType::LargeUtf8 => {
-                let mut b = ListBuilder::new(LargeStringBuilder::new())
-                    .with_field(item_field.as_ref().clone());
-                for v in &values {
-                    match v {
-                        SqlValue::Text(s) => {
-                            let items: Vec<Option<String>> =
-                                serde_json::from_str(s).unwrap_or_default();
-                            for item in items {
-                                b.values().append_option(item);
-                            }
-                            b.append(true);
-                        }
-                        _ => b.append(false),
-                    }
-                }
-                Arc::new(b.finish())
-            }
-            DataType::Utf8View => {
-                let mut b = ListBuilder::new(StringViewBuilder::new())
-                    .with_field(item_field.as_ref().clone());
-                for v in &values {
-                    match v {
-                        SqlValue::Text(s) => {
-                            let items: Vec<Option<String>> =
-                                serde_json::from_str(s).unwrap_or_default();
-                            for item in items {
-                                b.values().append_option(item);
-                            }
-                            b.append(true);
-                        }
-                        _ => b.append(false),
-                    }
-                }
-                Arc::new(b.finish())
-            }
-            DataType::Int64 => {
-                let mut b =
-                    ListBuilder::new(Int64Builder::new()).with_field(item_field.as_ref().clone());
-                for v in &values {
-                    match v {
-                        SqlValue::Text(s) => {
-                            let items: Vec<Option<i64>> =
-                                serde_json::from_str(s).unwrap_or_default();
-                            for item in items {
-                                b.values().append_option(item);
-                            }
-                            b.append(true);
-                        }
-                        _ => b.append(false),
-                    }
-                }
-                Arc::new(b.finish())
-            }
-            DataType::Int32 => {
-                let mut b =
-                    ListBuilder::new(Int32Builder::new()).with_field(item_field.as_ref().clone());
-                for v in &values {
-                    match v {
-                        SqlValue::Text(s) => {
-                            let items: Vec<Option<i32>> =
-                                serde_json::from_str(s).unwrap_or_default();
-                            for item in items {
-                                b.values().append_option(item);
-                            }
-                            b.append(true);
-                        }
-                        _ => b.append(false),
-                    }
-                }
-                Arc::new(b.finish())
-            }
-            inner => Err(DataFusionError::Execution(format!(
-                "SqliteLookupProvider: unsupported list item type {inner:?}"
-            )))?,
-        },
+        DataType::List(item_field) => json_text_to_list::<i32>(item_field, &values)?,
+        DataType::LargeList(item_field) => json_text_to_list::<i64>(item_field, &values)?,
         DataType::Float64 => {
             let arr: Float64Array = values
                 .iter()
