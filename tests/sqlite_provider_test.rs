@@ -374,6 +374,65 @@ async fn test_string_view_and_large_utf8_roundtrip() {
     assert!(view.contains(&None));
 }
 
+/// Companion to the scalar regression above: a `List<Utf8View>` payload must
+/// also round-trip. The write side serializes list elements to JSON TEXT, so a
+/// missing `Utf8View` reconstruction arm would write real values then fail on
+/// read-back with "unsupported list item type Utf8View".
+#[tokio::test]
+async fn test_list_utf8view_roundtrip() {
+    use arrow_array::ListArray;
+    use arrow_array::builder::{ListBuilder, StringViewBuilder};
+
+    let dir = tempdir().unwrap();
+
+    let item_field = Arc::new(Field::new("item", DataType::Utf8View, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("tags", DataType::List(item_field.clone()), true),
+    ]));
+
+    // Two rows, each a list of Utf8View strings (including a null element).
+    let mut lb = ListBuilder::new(StringViewBuilder::new()).with_field(item_field);
+    lb.values().append_value("red");
+    lb.values().append_null();
+    lb.append(true);
+    lb.values().append_value("blue");
+    lb.values().append_value("green");
+    lb.append(true);
+    let tags = lb.finish();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1_i64, 2])), Arc::new(tags)],
+    )
+    .unwrap();
+
+    let db_path = dir.path().join("lists.db");
+    let mut builder =
+        SqliteSidecarBuilder::begin(db_path.to_str().unwrap(), "models", 2, schema, 0, vec![1])
+            .unwrap();
+    builder.push_batch(&batch).unwrap();
+    let provider = builder.finish().unwrap();
+
+    let batches = provider.fetch_by_keys(&[1], "rowid", None).await.unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    let list = batches[0]
+        .column_by_name("tags")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("tags should reconstruct as a List");
+    let inner = list.value(0);
+    let strs = inner
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .expect("list items should reconstruct as StringViewArray");
+    assert_eq!(strs.len(), 2);
+    assert_eq!(strs.value(0), "red");
+    assert!(strs.is_null(1));
+}
+
 #[tokio::test]
 async fn test_projection() {
     let dir = tempdir().unwrap();

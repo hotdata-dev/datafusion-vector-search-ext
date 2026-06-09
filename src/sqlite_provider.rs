@@ -1218,6 +1218,24 @@ fn sql_values_to_arrow(dt: &DataType, values: Vec<SqlValue>) -> DFResult<ArrayRe
                 }
                 Arc::new(b.finish())
             }
+            DataType::Utf8View => {
+                let mut b = ListBuilder::new(StringViewBuilder::new())
+                    .with_field(item_field.as_ref().clone());
+                for v in &values {
+                    match v {
+                        SqlValue::Text(s) => {
+                            let items: Vec<Option<String>> =
+                                serde_json::from_str(s).unwrap_or_default();
+                            for item in items {
+                                b.values().append_option(item);
+                            }
+                            b.append(true);
+                        }
+                        _ => b.append(false),
+                    }
+                }
+                Arc::new(b.finish())
+            }
             DataType::Int64 => {
                 let mut b =
                     ListBuilder::new(Int64Builder::new()).with_field(item_field.as_ref().clone());
