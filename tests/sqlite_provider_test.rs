@@ -391,19 +391,25 @@ async fn test_list_utf8view_roundtrip() {
         Field::new("tags", DataType::List(item_field.clone()), true),
     ]));
 
-    // Two rows, each a list of Utf8View strings (including a null element).
+    // Four rows exercising: a populated list with a null element, another
+    // populated list, a NULL list cell, and an empty list.
     let mut lb = ListBuilder::new(StringViewBuilder::new()).with_field(item_field);
     lb.values().append_value("red");
     lb.values().append_null();
-    lb.append(true);
+    lb.append(true); // rowid 1: ["red", null]
     lb.values().append_value("blue");
     lb.values().append_value("green");
-    lb.append(true);
+    lb.append(true); // rowid 2: ["blue", "green"]
+    lb.append(false); // rowid 3: NULL list
+    lb.append(true); // rowid 4: [] (empty list)
     let tags = lb.finish();
 
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(Int64Array::from(vec![1_i64, 2])), Arc::new(tags)],
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4])),
+            Arc::new(tags),
+        ],
     )
     .unwrap();
 
@@ -431,6 +437,45 @@ async fn test_list_utf8view_roundtrip() {
     assert_eq!(strs.len(), 2);
     assert_eq!(strs.value(0), "red");
     assert!(strs.is_null(1));
+
+    // A NULL list cell survives as a null list entry; an empty list survives
+    // as a present-but-empty list (length 0), not as null.
+    let nullable = provider
+        .fetch_by_keys(&[3, 4], "rowid", None)
+        .await
+        .unwrap();
+    let mut null_lists = 0usize;
+    let mut empty_lists = 0usize;
+    for b in &nullable {
+        let rowid = b
+            .column_by_name("rowid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let list = b
+            .column_by_name("tags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            match rowid.value(i) {
+                3 => {
+                    assert!(list.is_null(i), "rowid 3 should be a NULL list");
+                    null_lists += 1;
+                }
+                4 => {
+                    assert!(list.is_valid(i), "rowid 4 should be a present empty list");
+                    assert_eq!(list.value(i).len(), 0, "rowid 4 should be empty");
+                    empty_lists += 1;
+                }
+                other => panic!("unexpected rowid {other}"),
+            }
+        }
+    }
+    assert_eq!(null_lists, 1);
+    assert_eq!(empty_lists, 1);
 }
 
 /// A `List<LargeUtf8>` payload must reconstruct with a `LargeStringArray` child.
