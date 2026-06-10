@@ -915,3 +915,200 @@ async fn test_basic_scalar_types_roundtrip() {
         .expect("rowid 1 should be present");
     assert_eq!(rowid_one, (true, 19_000));
 }
+
+/// Round-trips the remaining "basic" scalar types added in the same pass:
+/// the small integers (Int8/16, UInt8/16), time-of-day (Time32/Time64), and
+/// binary (Binary/LargeBinary). Each column must reconstruct with its original
+/// Arrow type and values, including nulls.
+#[tokio::test]
+async fn test_all_basic_types_roundtrip() {
+    use arrow_array::{
+        BinaryArray, Int8Array, Int16Array, LargeBinaryArray, Time32MillisecondArray,
+        Time64NanosecondArray, UInt8Array, UInt16Array,
+    };
+    use arrow_schema::TimeUnit;
+
+    let dir = tempdir().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("i8", DataType::Int8, true),
+        Field::new("i16", DataType::Int16, true),
+        Field::new("u8", DataType::UInt8, true),
+        Field::new("u16", DataType::UInt16, true),
+        Field::new("t32", DataType::Time32(TimeUnit::Millisecond), true),
+        Field::new("t64", DataType::Time64(TimeUnit::Nanosecond), true),
+        Field::new("bin", DataType::Binary, true),
+        Field::new("lbin", DataType::LargeBinary, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(Int8Array::from(vec![Some(-8_i8), None, Some(127)])),
+            Arc::new(Int16Array::from(vec![Some(-16_i16), Some(300), None])),
+            Arc::new(UInt8Array::from(vec![Some(8_u8), None, Some(255)])),
+            Arc::new(UInt16Array::from(vec![Some(16_u16), Some(65535), None])),
+            Arc::new(Time32MillisecondArray::from(vec![
+                Some(1_000_i32),
+                None,
+                Some(86_399_000),
+            ])),
+            Arc::new(Time64NanosecondArray::from(vec![
+                Some(1_i64),
+                Some(2),
+                None,
+            ])),
+            Arc::new(BinaryArray::from_opt_vec(vec![
+                Some(b"\x00\x01".as_ref()),
+                None,
+                Some(b"\xff".as_ref()),
+            ])),
+            Arc::new(LargeBinaryArray::from_opt_vec(vec![
+                Some(b"abc".as_ref()),
+                Some(b"".as_ref()),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+
+    let db_path = dir.path().join("allbasic.db");
+    let mut builder = SqliteSidecarBuilder::begin(
+        db_path.to_str().unwrap(),
+        "models",
+        2,
+        schema,
+        0,
+        vec![1, 2, 3, 4, 5, 6, 7, 8],
+    )
+    .unwrap();
+    builder.push_batch(&batch).unwrap();
+    let provider = builder.finish().unwrap();
+
+    // Fetch rows 1 and 3 and collect them keyed by rowid so assertions don't
+    // depend on row/batch ordering.
+    let batches = provider
+        .fetch_by_keys(&[1, 3], "rowid", None)
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+    // Every column must reconstruct with its declared Arrow type.
+    for b in &batches {
+        for f in b.schema().fields() {
+            assert_eq!(
+                b.column_by_name(f.name()).unwrap().data_type(),
+                f.data_type(),
+                "column {} reconstructed with wrong type",
+                f.name()
+            );
+        }
+    }
+
+    // Pull row 1's values out and check them concretely.
+    let (i8v, i16v, u8v, u16v, t32v, t64v, binv, lbinv) = batches
+        .iter()
+        .flat_map(|b| {
+            let rid = b
+                .column_by_name("rowid")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let i8a = b
+                .column_by_name("i8")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .expect("i8 should reconstruct as Int8Array");
+            let i16a = b
+                .column_by_name("i16")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap();
+            let u8a = b
+                .column_by_name("u8")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap();
+            let u16a = b
+                .column_by_name("u16")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .unwrap();
+            let t32a = b
+                .column_by_name("t32")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Time32MillisecondArray>()
+                .expect("t32 should reconstruct as Time32MillisecondArray");
+            let t64a = b
+                .column_by_name("t64")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Time64NanosecondArray>()
+                .unwrap();
+            let bina = b
+                .column_by_name("bin")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("bin should reconstruct as BinaryArray");
+            let lbina = b
+                .column_by_name("lbin")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            (0..b.num_rows())
+                .filter(|&i| rid.value(i) == 1)
+                .map(|i| {
+                    (
+                        i8a.value(i),
+                        i16a.value(i),
+                        u8a.value(i),
+                        u16a.value(i),
+                        t32a.value(i),
+                        t64a.value(i),
+                        bina.value(i).to_vec(),
+                        lbina.value(i).to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .next()
+        .expect("rowid 1 should be present");
+
+    assert_eq!(i8v, -8);
+    assert_eq!(i16v, -16);
+    assert_eq!(u8v, 8);
+    assert_eq!(u16v, 16);
+    assert_eq!(t32v, 1_000);
+    assert_eq!(t64v, 1);
+    assert_eq!(binv, vec![0x00, 0x01]);
+    assert_eq!(lbinv, b"abc".to_vec());
+
+    // Null cells in row 3 must survive as nulls (row 3: i8=127, i16=null,
+    // u16=null, t64=null, lbin=null).
+    let row3 = provider.fetch_by_keys(&[3], "rowid", None).await.unwrap();
+    let b = &row3[0];
+    let i16a = b
+        .column_by_name("i16")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .unwrap();
+    let lbina = b
+        .column_by_name("lbin")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .unwrap();
+    assert!(i16a.is_null(0), "row 3 i16 should be null");
+    assert!(lbina.is_null(0), "row 3 lbin should be null");
+}
