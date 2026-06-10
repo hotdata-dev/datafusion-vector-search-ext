@@ -25,7 +25,7 @@ use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, OffsetSizeTrait,
     RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, FieldRef, SchemaRef};
+use arrow_schema::{DataType, FieldRef, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result as DFResult;
@@ -213,6 +213,7 @@ impl SqliteLookupProvider {
                 "pool_size must be at least 1".into(),
             ));
         }
+        validate_payload_schema(&schema, 0)?;
         let conn = open_conn(db_path)?;
 
         let table_exists: bool = conn
@@ -336,6 +337,7 @@ impl SqliteSidecarBuilder {
                 value_col_indices.len()
             )));
         }
+        validate_payload_schema(&schema, key_col_index)?;
         let (create_sql, insert_sql) = ddl(table_name, &schema);
         let conn = open_conn(db_path)?;
         // Manual BEGIN/COMMIT rather than a borrowed `Transaction` so the
@@ -981,11 +983,85 @@ fn build_table(
 
 // ── Type conversion helpers ───────────────────────────────────────────────────
 
+/// Single source of truth for which Arrow types this provider can store in the
+/// sidecar **and** reconstruct on read-back. Every type that returns `true` here
+/// must have a matching arm in all of `arrow_cell_to_sql` (write), `arrow_type_to_sql`
+/// (column affinity), and `sql_values_to_arrow` (read). `validate_payload_schema`
+/// gates every build against this set so an unsupported column fails at index
+/// build time — not later at query time, half a sidecar in.
+fn payload_type_supported(dt: &DataType) -> bool {
+    match dt {
+        DataType::Boolean
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Timestamp(_, _) => true,
+        DataType::List(item) | DataType::LargeList(item) => {
+            list_item_type_supported(item.data_type())
+        }
+        _ => false,
+    }
+}
+
+/// Item types reconstructable by `json_text_to_list`. Lists are serialized to
+/// JSON TEXT, so only types with a JSON representation `serialize_list` writes
+/// and `json_text_to_list` reads are supported.
+fn list_item_type_supported(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Int32
+            | DataType::Int64
+    )
+}
+
+/// Reject a build whose payload columns include a type the read-back path cannot
+/// reconstruct. Called from every build entry point so the failure surfaces at
+/// index-creation time with the offending column named, rather than as a
+/// `unsupported Arrow type` error on the first query against a sidecar that
+/// "built successfully". `key_col_index` is skipped — keys are validated
+/// separately by `extract_key`.
+fn validate_payload_schema(schema: &SchemaRef, key_col_index: usize) -> DFResult<()> {
+    for (i, field) in schema.fields().iter().enumerate() {
+        if i == key_col_index {
+            continue;
+        }
+        if !payload_type_supported(field.data_type()) {
+            return Err(DataFusionError::Execution(format!(
+                "SqliteLookupProvider: payload column '{}' has unsupported type {:?}. \
+                 Supported types: Boolean, Int32/64, UInt32/64, Float32/64, \
+                 Utf8/LargeUtf8/Utf8View, Date32/64, Timestamp, and List/LargeList \
+                 of {{Utf8, LargeUtf8, Utf8View, Int32, Int64}}.",
+                field.name(),
+                field.data_type()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn arrow_type_to_sql(dt: &DataType) -> &'static str {
     match dt {
-        DataType::UInt64 | DataType::UInt32 | DataType::Int32 | DataType::Int64 => "INTEGER",
+        DataType::UInt64
+        | DataType::UInt32
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Boolean
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Timestamp(_, _) => "INTEGER",
         DataType::Float32 | DataType::Float64 => "REAL",
-        _ => "TEXT", // Utf8, LargeUtf8, List variants → TEXT (JSON for lists)
+        _ => "TEXT", // Utf8, LargeUtf8, Utf8View, List variants → TEXT (JSON for lists)
     }
 }
 
@@ -1057,7 +1133,54 @@ fn arrow_cell_to_sql(col: &ArrayRef, row: usize) -> SqlValue {
                 .unwrap()
                 .value(row),
         ),
+        DataType::Boolean => SqlValue::Integer(
+            col.as_any()
+                .downcast_ref::<arrow_array::BooleanArray>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        DataType::Date32 => SqlValue::Integer(
+            col.as_any()
+                .downcast_ref::<arrow_array::Date32Array>()
+                .unwrap()
+                .value(row) as i64,
+        ),
+        DataType::Date64 => SqlValue::Integer(
+            col.as_any()
+                .downcast_ref::<arrow_array::Date64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        // Timestamps are stored as their raw i64 tick count; the unit and time
+        // zone live in the schema and are restored on read-back.
+        DataType::Timestamp(unit, _) => {
+            let v = match unit {
+                TimeUnit::Second => col
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampSecondArray>()
+                    .unwrap()
+                    .value(row),
+                TimeUnit::Millisecond => col
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+                    .unwrap()
+                    .value(row),
+                TimeUnit::Microsecond => col
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                    .unwrap()
+                    .value(row),
+                TimeUnit::Nanosecond => col
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                    .unwrap()
+                    .value(row),
+            };
+            SqlValue::Integer(v)
+        }
         DataType::List(_) | DataType::LargeList(_) => SqlValue::Text(serialize_list(col, row)),
+        // Unreachable for any schema that passed `validate_payload_schema`; kept
+        // as a defensive fallback rather than a panic.
         _ => SqlValue::Null,
     }
 }
@@ -1238,6 +1361,61 @@ fn sql_values_to_arrow(dt: &DataType, values: Vec<SqlValue>) -> DFResult<ArrayRe
                 }
             }
             Arc::new(b.finish())
+        }
+        DataType::Boolean => {
+            let arr: arrow_array::BooleanArray = values
+                .iter()
+                .map(|v| match v {
+                    SqlValue::Integer(i) => Some(*i != 0),
+                    _ => None,
+                })
+                .collect();
+            Arc::new(arr)
+        }
+        DataType::Date32 => {
+            let arr: arrow_array::Date32Array = values
+                .iter()
+                .map(|v| match v {
+                    SqlValue::Integer(i) => Some(*i as i32),
+                    _ => None,
+                })
+                .collect();
+            Arc::new(arr)
+        }
+        DataType::Date64 => {
+            let arr: arrow_array::Date64Array = values
+                .iter()
+                .map(|v| match v {
+                    SqlValue::Integer(i) => Some(*i),
+                    _ => None,
+                })
+                .collect();
+            Arc::new(arr)
+        }
+        // Rebuild the unit-specific array, then restore the schema's time zone so
+        // the reconstructed column's DataType matches the original exactly.
+        DataType::Timestamp(unit, tz) => {
+            let it = values.iter().map(|v| match v {
+                SqlValue::Integer(i) => Some(*i),
+                _ => None,
+            });
+            match unit {
+                TimeUnit::Second => Arc::new(
+                    arrow_array::TimestampSecondArray::from_iter(it).with_timezone_opt(tz.clone()),
+                ),
+                TimeUnit::Millisecond => Arc::new(
+                    arrow_array::TimestampMillisecondArray::from_iter(it)
+                        .with_timezone_opt(tz.clone()),
+                ),
+                TimeUnit::Microsecond => Arc::new(
+                    arrow_array::TimestampMicrosecondArray::from_iter(it)
+                        .with_timezone_opt(tz.clone()),
+                ),
+                TimeUnit::Nanosecond => Arc::new(
+                    arrow_array::TimestampNanosecondArray::from_iter(it)
+                        .with_timezone_opt(tz.clone()),
+                ),
+            }
         }
         DataType::List(item_field) => json_text_to_list::<i32>(item_field, &values)?,
         DataType::LargeList(item_field) => json_text_to_list::<i64>(item_field, &values)?,

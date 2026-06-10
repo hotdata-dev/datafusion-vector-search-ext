@@ -781,3 +781,137 @@ async fn test_custom_key_column_name() {
         .unwrap();
     assert_eq!(key_col.value(0), 1);
 }
+
+/// The defect class behind hotdata-dev/runtimedb#631 was that the write side
+/// accepted any Arrow type (silent TEXT/NULL fallback) while the read side only
+/// reconstructed a subset — so an unsupported payload column built a "successful"
+/// sidecar that then exploded on the first query. This asserts the failure now
+/// surfaces at *build* time (`begin`) with the offending column named, which is
+/// where runtimedb's index-create step will catch it.
+#[tokio::test]
+async fn test_unsupported_payload_type_rejected_at_build() {
+    let dir = tempdir().unwrap();
+
+    // Decimal128 is a common parquet type the read-back path cannot reconstruct.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("price", DataType::Decimal128(10, 2), true),
+    ]));
+
+    let db_path = dir.path().join("bad.db");
+    let err =
+        SqliteSidecarBuilder::begin(db_path.to_str().unwrap(), "models", 2, schema, 0, vec![1])
+            .map(|_| ())
+            .expect_err("a Decimal128 payload column must be rejected at build time");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("price") && msg.contains("unsupported type"),
+        "error should name the offending column and type, got: {msg}"
+    );
+}
+
+/// Round-trips the basic scalar types added alongside the validation gate
+/// (Boolean, Date32, and a timezone-carrying Timestamp). These are exactly the
+/// kinds of columns DuckDB/parquet emit that previously fell through to the
+/// "unsupported Arrow type" error on read-back.
+#[tokio::test]
+async fn test_basic_scalar_types_roundtrip() {
+    use arrow_array::{BooleanArray, Date32Array, TimestampMicrosecondArray};
+    use arrow_schema::TimeUnit;
+
+    let dir = tempdir().unwrap();
+
+    let ts_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("flag", DataType::Boolean, true),
+        Field::new("day", DataType::Date32, true),
+        Field::new("ts", ts_type.clone(), true),
+    ]));
+
+    let ts_array =
+        TimestampMicrosecondArray::from(vec![Some(1_000_000_i64), None, Some(3_000_000)])
+            .with_timezone_opt(Some("UTC".to_string()));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+            Arc::new(Date32Array::from(vec![
+                Some(19_000_i32),
+                None,
+                Some(19_002),
+            ])),
+            Arc::new(ts_array),
+        ],
+    )
+    .unwrap();
+
+    let db_path = dir.path().join("basics.db");
+    let mut builder = SqliteSidecarBuilder::begin(
+        db_path.to_str().unwrap(),
+        "models",
+        2,
+        schema,
+        0,
+        vec![1, 2, 3],
+    )
+    .unwrap();
+    builder.push_batch(&batch).unwrap();
+    let provider = builder.finish().unwrap();
+
+    let batches = provider
+        .fetch_by_keys(&[1, 3], "rowid", None)
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+    // The timestamp column must reconstruct with its original unit *and* time
+    // zone, otherwise the column's DataType won't match the declared schema.
+    for b in &batches {
+        assert_eq!(b.column_by_name("ts").unwrap().data_type(), &ts_type);
+        b.column_by_name("flag")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("flag should reconstruct as BooleanArray");
+        b.column_by_name("day")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .expect("day should reconstruct as Date32Array");
+    }
+
+    // Spot-check rowid 1's values survived the round-trip.
+    let rowid_one = batches
+        .iter()
+        .flat_map(|b| {
+            let rid = b
+                .column_by_name("rowid")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let flag = b
+                .column_by_name("flag")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap();
+            let day = b
+                .column_by_name("day")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap();
+            (0..b.num_rows())
+                .filter(|&i| rid.value(i) == 1)
+                .map(|i| (flag.value(i), day.value(i)))
+                .collect::<Vec<_>>()
+        })
+        .next()
+        .expect("rowid 1 should be present");
+    assert_eq!(rowid_one, (true, 19_000));
+}
