@@ -1112,3 +1112,34 @@ async fn test_all_basic_types_roundtrip() {
     assert!(i16a.is_null(0), "row 3 i16 should be null");
     assert!(lbina.is_null(0), "row 3 lbin should be null");
 }
+
+/// The output schema's key is always field 0, but `begin`'s `key_col_index`
+/// indexes the *input batch* and may be non-zero (e.g. a storage engine whose
+/// key is not the first batch column). Validation must still key off output
+/// field 0 — otherwise a non-zero `key_col_index` would skip a real payload
+/// column (leaving its unsupported type to fail at query time) and validate the
+/// key column instead. This locks that in.
+#[tokio::test]
+async fn test_unsupported_payload_rejected_with_nonzero_key_index() {
+    let dir = tempdir().unwrap();
+
+    // Output schema: key at field 0, an unsupported Decimal payload at field 1.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("price", DataType::Decimal128(10, 2), true),
+    ]));
+
+    // key_col_index = 1 (key is the second column of the input batch). A bug that
+    // skipped output field `key_col_index` would skip "price" and wrongly pass.
+    let db_path = dir.path().join("nonzero_key.db");
+    let err =
+        SqliteSidecarBuilder::begin(db_path.to_str().unwrap(), "models", 2, schema, 1, vec![0])
+            .map(|_| ())
+            .expect_err("unsupported payload must be rejected regardless of key_col_index");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("price") && msg.contains("unsupported type"),
+        "error should name the payload column, got: {msg}"
+    );
+}

@@ -213,7 +213,7 @@ impl SqliteLookupProvider {
                 "pool_size must be at least 1".into(),
             ));
         }
-        validate_payload_schema(&schema, 0)?;
+        validate_payload_schema(&schema)?;
         let conn = open_conn(db_path)?;
 
         let table_exists: bool = conn
@@ -337,7 +337,7 @@ impl SqliteSidecarBuilder {
                 value_col_indices.len()
             )));
         }
-        validate_payload_schema(&schema, key_col_index)?;
+        validate_payload_schema(&schema)?;
         let (create_sql, insert_sql) = ddl(table_name, &schema);
         let conn = open_conn(db_path)?;
         // Manual BEGIN/COMMIT rather than a borrowed `Transaction` so the
@@ -1037,11 +1037,16 @@ fn list_item_type_supported(dt: &DataType) -> bool {
 /// reconstruct. Called from every build entry point so the failure surfaces at
 /// index-creation time with the offending column named, rather than as a
 /// `unsupported Arrow type` error on the first query against a sidecar that
-/// "built successfully". `key_col_index` is skipped — keys are validated
-/// separately by `extract_key`.
-fn validate_payload_schema(schema: &SchemaRef, key_col_index: usize) -> DFResult<()> {
+/// "built successfully".
+///
+/// Field 0 of the *output* schema is always the key column — both `finish()` and
+/// `open_or_build` derive the key name from `schema.field(0)` — so it is skipped
+/// here and validated separately by `extract_key`. (Note this is the output
+/// schema's key position, distinct from `begin`'s `key_col_index`, which indexes
+/// the input batch.)
+fn validate_payload_schema(schema: &SchemaRef) -> DFResult<()> {
     for (i, field) in schema.fields().iter().enumerate() {
-        if i == key_col_index {
+        if i == 0 {
             continue;
         }
         if !payload_type_supported(field.data_type()) {
