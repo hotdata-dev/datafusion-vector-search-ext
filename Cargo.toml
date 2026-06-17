@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 [features]
 parquet-provider = ["dep:parquet", "dep:object_store", "dep:bytes"]
 sqlite-provider  = ["dep:rusqlite", "dep:serde_json", "dep:parquet"]
-feather-provider = ["dep:arrow-ipc"]
+feather-provider = ["dep:arrow-ipc", "dep:memmap2", "dep:tempfile"]
 
 [dependencies]
 tracing      = "0.1"
@@ -30,10 +30,13 @@ bytes        = { version = "1",      optional = true }
 rusqlite     = { version = "0.32", optional = true, features = ["bundled"] }
 serde_json   = { version = "1",    optional = true }
 
-# feather-provider — Arrow IPC (Feather v2) read/write. `take`, `sort_to_indices`,
-# and `concat_batches` come from `datafusion::arrow::compute`, so the only extra
-# dep is the IPC reader/writer.
+# feather-provider — Arrow IPC (Feather v2). `take`/`concat_batches`/`interleave`
+# come from `datafusion::arrow::compute`; the extra deps are the IPC reader/writer,
+# `memmap2` for the zero-copy mmap read path, and `tempfile` for the bounded-memory
+# (spill-sort) build path.
 arrow-ipc    = { version = "58", optional = true }
+memmap2      = { version = "0.9", optional = true }
+tempfile     = { version = "3",   optional = true }
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["rt-multi-thread", "macros"] }

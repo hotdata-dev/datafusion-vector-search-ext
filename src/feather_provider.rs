@@ -1,35 +1,45 @@
 // feather_provider.rs — Arrow/Feather (Arrow IPC) positional PointLookupProvider.
 //
 // A drop-in alternative to `SqliteLookupProvider` for the DuckLake vector-search
-// payload sidecar. Where SQLite stores rows in a B-tree keyed by `rowid` and
-// hydrates via `WHERE rowid IN (...)`, this provider stores the payload as a
-// single Arrow IPC file sorted ascending by the (sparse / holey) `rowid`, and
-// hydrates by:
+// payload sidecar. The payload is stored as an Arrow IPC file sorted ascending by
+// the (sparse / holey) `rowid` key. Hydration is:
 //
-//   1. binary-searching the sorted `rowid` column for each requested key
-//      (`slice::partition_point`),
-//   2. guarding with an exact-match check (`rowid[pos] == key`) so a missing
-//      rowid never aliases its neighbour, then
-//   3. `take`-ing the matched physical positions out of the payload columns.
+//   1. a coarse per-batch first-key index narrows to the batch that may hold a
+//      requested key,
+//   2. `slice::partition_point` binary-searches that batch's rowid column,
+//   3. an exact-match guard (`rowid[pos] == key`) rejects a missing rowid, then
+//   4. `take` pulls the matched physical rows out of the payload columns.
 //
-// The sorted `rowid` column *is* the index — no separate structure. Because the
-// payload is stored verbatim Arrow, hydration is `select(proj).take(positions)`
-// with zero type conversion: no `arrow_cell_to_sql` on build, no
-// `sql_values_to_arrow` on read, and no rejection/coercion of Decimal / Struct /
-// Map / FixedSizeList / Dictionary / Timestamp(tz) / nested List.
+// Memory parity with SQLite (which pages its B-tree) comes from two pieces:
 //
-// Scope: the whole file is read into memory once at open and held resident (the
-// "expand to uncompressed on NVMe before querying" model). mmap demand-paging and
-// a coarse per-batch index for multi-GB sidecars are follow-ups, not implemented
-// here.
+//   * READ: the file is `mmap`'d and the Arrow arrays are decoded ZERO-COPY
+//     (`FileDecoder` over a `Buffer` backed by the mapping), so column buffers
+//     point into the mapped file. `take` over scattered keys faults in only the
+//     touched pages; only the small K-row output is heap-allocated. Resident
+//     payload memory is bounded by the working set, not the file size.
+//
+//   * BUILD: a bounded-memory external (spill) sort. Rows stream UNSORTED to a
+//     temp IPC file (O(one batch) payload resident); only an O(N)·8 B key index
+//     is kept in memory. At `finish` the keys are argsorted and the rows are
+//     gathered in sorted order from the mmap'd temp via `interleave`, in bounded
+//     chunks, into the final sorted file. No full-payload buffering, and no
+//     assumption about the input scan's row order.
+//
+// Because the payload is stored verbatim Arrow, there is zero type conversion:
+// Decimal / Struct / Map / FixedSizeList / Dictionary / Timestamp(tz) / nested
+// List all round-trip losslessly (unlike the SQLite provider, which rejects or
+// coerces them).
 
 use std::any::Any;
 use std::fmt;
+use std::fs::File;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::SchemaRef;
+use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
+use datafusion::arrow::buffer::Buffer;
 use datafusion::arrow::compute;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result as DFResult;
@@ -40,62 +50,171 @@ use datafusion::physical_plan::ExecutionPlan;
 
 use crate::lookup::{PointLookupProvider, extract_keys_as_u64};
 
+/// Rows per output batch when gathering the sorted result at build time. Bounds
+/// the per-chunk `interleave` working set.
+const BUILD_CHUNK_ROWS: usize = 8192;
+
+// ── mmap + zero-copy IPC decode ─────────────────────────────────────────────────
+
+/// Memory-map `path` and decode every Arrow IPC record batch ZERO-COPY: the
+/// returned arrays' buffers point into the mapping (kept alive by the returned
+/// [`Buffer`]'s custom allocation owner), so nothing is copied onto the heap.
+fn mmap_feather(path: &str) -> DFResult<(SchemaRef, Vec<RecordBatch>, Buffer)> {
+    use arrow_ipc::convert::fb_to_schema;
+    use arrow_ipc::reader::{FileDecoder, read_footer_length};
+    use arrow_ipc::root_as_footer;
+
+    let file = File::open(path)
+        .map_err(|e| DataFusionError::Execution(format!("open feather sidecar {path}: {e}")))?;
+    // SAFETY: the file is treated as immutable for the provider's lifetime (built
+    // once, then read-only). The mapping is owned by the `Buffer` below.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| DataFusionError::Execution(format!("mmap feather sidecar {path}: {e}")))?;
+    let len = mmap.len();
+    if len < 10 {
+        return Err(DataFusionError::Execution(format!(
+            "feather sidecar {path} is too small to be a valid Arrow IPC file ({len} bytes)"
+        )));
+    }
+    let ptr = NonNull::new(mmap.as_ptr() as *mut u8).ok_or_else(|| {
+        DataFusionError::Execution(format!("feather sidecar {path}: null mmap pointer"))
+    })?;
+    // SAFETY: `ptr`/`len` describe the mapping, and the `Arc<Mmap>` owner keeps it
+    // alive for as long as any slice of this Buffer (or array derived from it) lives.
+    let buffer = unsafe { Buffer::from_custom_allocation(ptr, len, Arc::new(mmap)) };
+
+    let trailer_start = len - 10;
+    let footer_len = read_footer_length(buffer[trailer_start..].try_into().map_err(|_| {
+        DataFusionError::Execution(format!("feather sidecar {path}: bad IPC trailer"))
+    })?)
+    .map_err(|e| DataFusionError::Execution(format!("feather sidecar {path}: {e}")))?;
+    let footer = root_as_footer(&buffer[trailer_start - footer_len..trailer_start])
+        .map_err(|e| DataFusionError::Execution(format!("feather sidecar {path}: {e}")))?;
+
+    let schema: SchemaRef = Arc::new(fb_to_schema(footer.schema().ok_or_else(|| {
+        DataFusionError::Execution(format!("feather sidecar {path}: footer has no schema"))
+    })?));
+
+    let mut decoder = FileDecoder::new(schema.clone(), footer.version());
+    for block in footer.dictionaries().iter().flatten() {
+        let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+        let data = buffer.slice_with_length(block.offset() as usize, block_len);
+        decoder
+            .read_dictionary(block, &data)
+            .map_err(|e| DataFusionError::Execution(format!("feather sidecar {path}: {e}")))?;
+    }
+
+    let mut batches = Vec::new();
+    if let Some(record_batches) = footer.recordBatches() {
+        for block in record_batches {
+            let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
+            let data = buffer.slice_with_length(block.offset() as usize, block_len);
+            if let Some(batch) = decoder
+                .read_record_batch(block, &data)
+                .map_err(|e| DataFusionError::Execution(format!("feather sidecar {path}: {e}")))?
+            {
+                batches.push(batch);
+            }
+        }
+    }
+    Ok((schema, batches, buffer))
+}
+
+// ── Key helpers (u64 ordering domain — matches `extract_keys_as_u64`) ───────────
+
+/// Read the key at `row` as `u64`. Supports the same integer key types as
+/// `extract_keys_as_u64` (Int64/UInt64/Int32/UInt32).
+fn key_at(col: &dyn Array, row: usize) -> DFResult<u64> {
+    let any = col.as_any();
+    if let Some(a) = any.downcast_ref::<Int64Array>() {
+        return Ok(a.value(row) as u64);
+    }
+    if let Some(a) = any.downcast_ref::<UInt64Array>() {
+        return Ok(a.value(row));
+    }
+    if let Some(a) = any.downcast_ref::<Int32Array>() {
+        return Ok(a.value(row) as u64);
+    }
+    if let Some(a) = any.downcast_ref::<UInt32Array>() {
+        return Ok(a.value(row) as u64);
+    }
+    Err(DataFusionError::Execution(format!(
+        "FeatherLookupProvider: key column type {:?} is not supported; use Int64/UInt64/Int32/UInt32",
+        col.data_type()
+    )))
+}
+
+/// First index `i` in `col` whose key (compared as `u64`) is `>= target`.
+/// Binary search over the sorted key column — touches only the pages it reads.
+fn partition_point_u64(col: &dyn Array, target: u64) -> DFResult<usize> {
+    let any = col.as_any();
+    if let Some(a) = any.downcast_ref::<Int64Array>() {
+        return Ok(a.values().partition_point(|&v| (v as u64) < target));
+    }
+    if let Some(a) = any.downcast_ref::<UInt64Array>() {
+        return Ok(a.values().partition_point(|&v| v < target));
+    }
+    if let Some(a) = any.downcast_ref::<Int32Array>() {
+        return Ok(a.values().partition_point(|&v| (v as u64) < target));
+    }
+    if let Some(a) = any.downcast_ref::<UInt32Array>() {
+        return Ok(a.values().partition_point(|&v| (v as u64) < target));
+    }
+    Err(DataFusionError::Execution(format!(
+        "FeatherLookupProvider: key column type {:?} is not supported; use Int64/UInt64/Int32/UInt32",
+        col.data_type()
+    )))
+}
+
 // ── Provider ──────────────────────────────────────────────────────────────────
 
-/// In-memory, sorted-by-key Arrow positional [`PointLookupProvider`].
+/// mmap-backed, sorted-by-key Arrow positional [`PointLookupProvider`].
 ///
-/// Holds the full payload as one concatenated [`RecordBatch`] (sorted ascending
-/// by the key column, which is field 0 of the schema) plus a contiguous
-/// `Vec<u64>` of the key values for binary search. Built by
-/// [`FeatherSidecarBuilder`] or opened from an existing `.feather` file with
+/// Holds the payload as zero-copy [`RecordBatch`]es referencing the mmap, in
+/// ascending-key order, plus a tiny first-key-per-batch coarse index. Built by
+/// [`FeatherSidecarBuilder`] or opened from a `.feather` file with
 /// [`open`](Self::open).
 pub struct FeatherLookupProvider {
     schema: SchemaRef,
-    /// Payload rows, sorted ascending by `keys[i]`. Row `i` of every column
-    /// corresponds to `keys[i]`.
-    batch: RecordBatch,
-    /// Sorted ascending key values, one per row of `batch`. The contiguous
-    /// `rowid` index: `partition_point` over this maps a key → physical row.
-    keys: Arc<Vec<u64>>,
+    /// Payload batches, ascending by key and non-overlapping across batches.
+    /// Arrays reference the mmap (see `_mmap`).
+    batches: Vec<RecordBatch>,
+    /// Coarse index: first key of `batches[i]`, ascending. Narrows a lookup to a
+    /// single batch before the in-batch binary search.
+    batch_first_key: Vec<u64>,
+    /// Keeps the memory mapping alive; the batch arrays' buffers point into it.
+    _mmap: Buffer,
     key_col: String,
+    n_rows: usize,
 }
 
 impl fmt::Debug for FeatherLookupProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "FeatherLookupProvider(key_col={}, rows={}, schema_cols={})",
+            "FeatherLookupProvider(key_col={}, rows={}, batches={}, schema_cols={})",
             self.key_col,
-            self.keys.len(),
+            self.n_rows,
+            self.batches.len(),
             self.schema.fields().len()
         )
     }
 }
 
 impl FeatherLookupProvider {
-    /// Open an existing `.feather` (Arrow IPC file) sidecar.
+    /// Open an existing `.feather` (Arrow IPC file) sidecar via mmap.
     ///
-    /// Reads every batch, concatenates them into one resident batch, and lifts
-    /// the key column (field 0) into a contiguous `Vec<u64>`. The on-disk schema
-    /// is self-describing, so the provider's [`schema`](PointLookupProvider::schema)
-    /// is taken from the file verbatim. Fails if the stored key column is not
-    /// sorted ascending — `fetch_by_keys`' binary search depends on it, and the
-    /// builder always writes sorted, so an unsorted file signals corruption.
+    /// The on-disk schema is self-describing, so the provider's
+    /// [`schema`](PointLookupProvider::schema) is taken from the file. Fails if
+    /// the stored key column is not strictly ascending — the binary search
+    /// depends on it, and the builder always writes it sorted, so a violation
+    /// signals a corrupt or foreign file.
     pub fn open(path: &str) -> DFResult<Self> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| DataFusionError::Execution(format!("open feather sidecar {path}: {e}")))?;
-        let reader = arrow_ipc::reader::FileReader::try_new(file, None)
-            .map_err(|e| DataFusionError::Execution(format!("read feather sidecar {path}: {e}")))?;
-        let schema = reader.schema();
-        let batches = reader.collect::<Result<Vec<_>, _>>().map_err(|e| {
-            DataFusionError::Execution(format!("decode feather sidecar {path}: {e}"))
-        })?;
-        Self::from_batches(schema, batches)
+        let (schema, batches, mmap) = mmap_feather(path)?;
+        Self::from_parts(schema, batches, mmap)
     }
 
-    /// Build a provider from already-decoded, sorted-by-key batches. Shared by
-    /// [`open`](Self::open) and [`FeatherSidecarBuilder::finish`].
-    fn from_batches(schema: SchemaRef, batches: Vec<RecordBatch>) -> DFResult<Self> {
+    fn from_parts(schema: SchemaRef, batches: Vec<RecordBatch>, mmap: Buffer) -> DFResult<Self> {
         if schema.fields().is_empty() {
             return Err(DataFusionError::Execution(
                 "FeatherLookupProvider: schema has no columns; field 0 must be the key column"
@@ -104,43 +223,67 @@ impl FeatherLookupProvider {
         }
         let key_col = schema.field(0).name().clone();
 
-        // One contiguous batch so `take` addresses a global physical position.
-        let batch = if batches.is_empty() {
-            RecordBatch::new_empty(schema.clone())
-        } else {
-            compute::concat_batches(&schema, &batches)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
-        };
-
-        let keys: Vec<u64> = key_column_as_u64(batch.column(0).as_ref())?;
-
-        // Binary search requires strictly-ascending keys: ascending so
-        // `partition_point` is valid, and unique so a key maps to one physical
-        // row (mirroring SQLite's `INTEGER PRIMARY KEY`, which rejects duplicate
-        // keys at build). The builder guarantees this; verify defensively so a
-        // bad file fails loudly at open, not silently at query time with wrong
-        // rows. Compared in u64 order to match the build sort and the search.
-        if keys.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(DataFusionError::Execution(format!(
-                "FeatherLookupProvider: key column '{key_col}' is not strictly ascending \
-                 (unsorted or duplicate keys); the sidecar is corrupt or was not built by \
-                 FeatherSidecarBuilder"
-            )));
+        // Build the coarse index and verify the global ascending+unique invariant
+        // the binary search relies on (within each batch and across batches).
+        let mut batch_first_key: Vec<u64> = Vec::with_capacity(batches.len());
+        let mut n_rows = 0usize;
+        let mut prev_last: Option<u64> = None;
+        let mut kept: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let nrows = batch.num_rows();
+            if nrows == 0 {
+                continue;
+            }
+            let keycol = batch.column(0).as_ref();
+            if keycol.null_count() > 0 {
+                return Err(DataFusionError::Execution(
+                    "FeatherLookupProvider: key column has a null value; row keys must be non-null"
+                        .into(),
+                ));
+            }
+            let first = key_at(keycol, 0)?;
+            // Strictly ascending within the batch.
+            let mut prev = first;
+            for r in 1..nrows {
+                let k = key_at(keycol, r)?;
+                if k <= prev {
+                    return Err(DataFusionError::Execution(format!(
+                        "FeatherLookupProvider: key column '{key_col}' is not strictly ascending \
+                         (unsorted or duplicate keys); the sidecar is corrupt or was not built by \
+                         FeatherSidecarBuilder"
+                    )));
+                }
+                prev = k;
+            }
+            // Strictly ascending across the batch boundary.
+            if prev_last.is_some_and(|pl| first <= pl) {
+                return Err(DataFusionError::Execution(format!(
+                    "FeatherLookupProvider: key column '{key_col}' is not strictly ascending \
+                     across batches; the sidecar is corrupt or was not built by \
+                     FeatherSidecarBuilder"
+                )));
+            }
+            prev_last = Some(prev);
+            batch_first_key.push(first);
+            n_rows += nrows;
+            kept.push(batch);
         }
 
         Ok(Self {
             schema,
-            batch,
-            keys: Arc::new(keys),
+            batches: kept,
+            batch_first_key,
+            _mmap: mmap,
             key_col,
+            n_rows,
         })
     }
 
     pub fn len(&self) -> usize {
-        self.keys.len()
+        self.n_rows
     }
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.n_rows == 0
     }
 }
 
@@ -156,67 +299,93 @@ impl PointLookupProvider for FeatherLookupProvider {
         _key_col: &str,
         projection: Option<&[usize]>,
     ) -> DFResult<Vec<RecordBatch>> {
-        if keys.is_empty() {
+        if keys.is_empty() || self.batches.is_empty() {
             return Ok(vec![]);
         }
 
-        // Sort + dedup the requested keys. Sorting makes the resulting physical
-        // positions ascending, so the output is ordered by key — matching
-        // SQLite's `ORDER BY rowid`. Dedup matches `WHERE key IN (...)`, which
-        // returns one row per distinct key regardless of repeats.
+        // Validate the projection up front and gracefully (like
+        // `RecordBatch::project`), rather than panicking on an out-of-range index.
+        let nfields = self.schema.fields().len();
+        let proj: Vec<usize> = match projection {
+            None => (0..nfields).collect(),
+            Some(idxs) => {
+                if let Some(&bad) = idxs.iter().find(|&&i| i >= nfields) {
+                    return Err(DataFusionError::Execution(format!(
+                        "FeatherLookupProvider: projection index {bad} out of bounds for schema \
+                         with {nfields} columns"
+                    )));
+                }
+                idxs.to_vec()
+            }
+        };
+        let out_schema: SchemaRef = Arc::new(Schema::new(
+            proj.iter()
+                .map(|&i| self.schema.field(i).clone())
+                .collect::<Vec<_>>(),
+        ));
+
+        // Sort + dedup the requested keys: sorting yields ascending output
+        // (matching SQLite's `ORDER BY rowid`); dedup matches `WHERE key IN (...)`.
         let mut want = keys.to_vec();
         want.sort_unstable();
         want.dedup();
 
-        // Map each requested key to a physical position via binary search, with
-        // an exact-match guard so an absent key is skipped rather than aliased
-        // onto its lower-bound neighbour.
-        let mut positions: Vec<u64> = Vec::with_capacity(want.len());
+        // Resolve each present key to (batch index, local row), in ascending key
+        // order. The coarse index narrows to a batch; partition_point + exact
+        // match locate the row within it.
+        let mut matches: Vec<(usize, u32)> = Vec::with_capacity(want.len());
         for &k in &want {
-            let pos = self.keys.partition_point(|&v| v < k);
-            if pos < self.keys.len() && self.keys[pos] == k {
-                positions.push(pos as u64);
+            let cb = self.batch_first_key.partition_point(|&fk| fk <= k);
+            if cb == 0 {
+                continue; // below the smallest stored key
+            }
+            let b = cb - 1;
+            let keycol = self.batches[b].column(0).as_ref();
+            let pos = partition_point_u64(keycol, k)?;
+            if pos < self.batches[b].num_rows() && key_at(keycol, pos)? == k {
+                matches.push((b, pos as u32));
             }
         }
-        if positions.is_empty() {
+        if matches.is_empty() {
             return Ok(vec![]);
         }
 
-        // Columns to read, in output order. Projection indexes into the provider
-        // schema (0 = key column), mirroring the SQLite provider's contract.
-        let col_indices: Vec<usize> = match projection {
-            None => (0..self.schema.fields().len()).collect(),
-            Some(idxs) => idxs.to_vec(),
-        };
-        let out_schema: SchemaRef = match projection {
-            None => self.schema.clone(),
-            Some(idxs) => Arc::new(arrow_schema::Schema::new(
-                idxs.iter()
-                    .map(|&i| self.schema.field(i).clone())
-                    .collect::<Vec<_>>(),
-            )),
-        };
+        // `matches` is grouped by batch (ascending k → non-decreasing batch idx).
+        // `take` each batch's projected columns once, then concat into one batch.
+        let mut out_batches: Vec<RecordBatch> = Vec::new();
+        let mut j = 0;
+        while j < matches.len() {
+            let b = matches[j].0;
+            let mut locals: Vec<u32> = Vec::new();
+            while j < matches.len() && matches[j].0 == b {
+                locals.push(matches[j].1);
+                j += 1;
+            }
+            let idx = UInt32Array::from(locals);
+            let cols: Vec<ArrayRef> = proj
+                .iter()
+                .map(|&c| {
+                    compute::take(self.batches[b].column(c).as_ref(), &idx, None)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                })
+                .collect::<DFResult<_>>()?;
+            out_batches.push(
+                RecordBatch::try_new(out_schema.clone(), cols)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
+            );
+        }
 
-        let pos_arr = UInt64Array::from(positions);
-        let cols: Vec<ArrayRef> = col_indices
-            .iter()
-            .map(|&i| {
-                compute::take(self.batch.column(i).as_ref(), &pos_arr, None)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-            })
-            .collect::<DFResult<_>>()?;
-
-        let batch = RecordBatch::try_new(out_schema, cols)
+        let combined = compute::concat_batches(&out_schema, &out_batches)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        Ok(vec![batch])
+        Ok(vec![combined])
     }
 }
 
 // ── TableProvider ─────────────────────────────────────────────────────────────
 //
-// Mirrors `SqliteLookupProvider` / `HashKeyProvider`: the payload is already
-// resident, so a full scan is a cheap MemTable over the single batch. This lets
-// DataFusion resolve column names when the provider is registered as a table.
+// The payload is already addressable (mmap'd batches), so a full scan is a cheap
+// MemTable over them. Lets DataFusion resolve column names when the provider is
+// registered as a table.
 
 #[async_trait]
 impl TableProvider for FeatherLookupProvider {
@@ -236,59 +405,50 @@ impl TableProvider for FeatherLookupProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let mem = MemTable::try_new(self.schema.clone(), vec![vec![self.batch.clone()]])?;
+        let mem = MemTable::try_new(self.schema.clone(), vec![self.batches.clone()])?;
         mem.scan(state, projection, &[], None).await
     }
 }
 
-// ── Streaming sidecar builder ───────────────────────────────────────────────
+// ── Streaming sidecar builder (bounded-memory external sort) ─────────────────────
 
 /// Incremental builder for a [`FeatherLookupProvider`], the Feather analogue of
 /// [`SqliteSidecarBuilder`](crate::sqlite_provider::SqliteSidecarBuilder).
 ///
 /// Takes input [`RecordBatch`]es one at a time (e.g. from the DuckLake
-/// snapshot-pinned, row-lineage scan), reading each row's key from a designated
-/// column and projecting the value columns into the output schema. On
-/// [`finish`](Self::finish) the buffered rows are sorted ascending by key and
-/// written as one Arrow IPC batch.
+/// snapshot-pinned, row-lineage scan), reads each row's key from a designated
+/// column, and projects the value columns into the output schema.
 ///
-/// **Sort-agnostic by design.** Unlike the SQLite B-tree (which is order
-/// independent), Feather binary search requires the on-disk key column sorted.
-/// Rather than depend on the DuckLake scan emitting sorted rowids — the ticket's
-/// top open risk — this builder sorts at `finish`, so correctness holds for any
-/// input order. Whether the input was *already* sorted is tracked and reported
-/// via [`input_was_sorted`](Self::input_was_sorted), feeding the decision on
-/// whether a bounded-memory merge (instead of the in-memory sort) is needed at
-/// production scale.
+/// **Bounded memory, order-agnostic.** Feather binary search needs the on-disk
+/// key column sorted, but — unlike SQLite's order-independent B-tree — the input
+/// scan's row order is not guaranteed (DuckLake `rowid` order from the scan is
+/// not reliable). Rather than buffer the whole payload and sort it (O(N)
+/// resident) or depend on the scan emitting sorted rowids, this builder spills:
+/// [`push_batch`](Self::push_batch) writes rows UNSORTED to a temp IPC file
+/// (O(one batch) payload resident), keeping only an O(N)·8 B key index in memory;
+/// [`finish`](Self::finish) argsorts the keys and gathers the rows in sorted
+/// order from the mmap'd temp via `interleave`, in bounded chunks, into the final
+/// sorted file. Duplicate keys are rejected (mirroring SQLite's primary key).
 ///
-/// **Memory:** the builder buffers all projected rows before sorting — O(N)
-/// resident. A bounded-memory external merge-of-sorted-runs is the scale plan;
-/// it is not implemented here.
-///
-/// The first field of `schema` is the key column; fields 1.. are the stored
-/// value columns. `key_col_index` / `value_col_indices` index into the *input*
-/// batches passed to [`push_batch`](Self::push_batch) (matching
-/// [`SqliteSidecarBuilder::begin`](crate::sqlite_provider::SqliteSidecarBuilder::begin)).
+/// The first field of `schema` is the key column; fields 1.. are the stored value
+/// columns. `key_col_index` / `value_col_indices` index the *input* batches.
 pub struct FeatherSidecarBuilder {
-    path: String,
+    final_path: String,
     schema: SchemaRef,
     key_col_index: usize,
     value_col_indices: Vec<usize>,
-    /// Projected batches conforming to `schema`, accumulated across push_batch.
-    buffered: Vec<RecordBatch>,
-    /// Largest key seen so far, to detect whether the input stream is already
-    /// globally sorted ascending.
+    /// Unsorted spill file; rows are appended in push order. Auto-removed on drop.
+    temp: tempfile::NamedTempFile,
+    writer: arrow_ipc::writer::FileWriter<File>,
+    /// Key of each row, in push (spill) order — the only O(N) in-memory state.
+    keys: Vec<u64>,
     last_key: Option<u64>,
     input_sorted: bool,
 }
 
 impl FeatherSidecarBuilder {
-    /// Begin a build targeting `path` (the output `.feather` file).
-    ///
-    /// `schema` is the output schema — field 0 is the key column, fields 1.. are
-    /// the stored value columns, verbatim Arrow (no type validation: storing
-    /// types SQLite rejects is the point). `key_col_index` and
-    /// `value_col_indices` index into the input batches.
+    /// Begin a build targeting `path` (the output `.feather` file). Opens the
+    /// temp spill file immediately.
     pub fn begin(
         path: &str,
         schema: SchemaRef,
@@ -308,21 +468,28 @@ impl FeatherSidecarBuilder {
                 value_col_indices.len()
             )));
         }
+        let temp = tempfile::NamedTempFile::new()
+            .map_err(|e| DataFusionError::Execution(format!("create feather spill file: {e}")))?;
+        let spill = temp
+            .reopen()
+            .map_err(|e| DataFusionError::Execution(format!("open feather spill file: {e}")))?;
+        let writer = arrow_ipc::writer::FileWriter::try_new(spill, &schema)
+            .map_err(|e| DataFusionError::Execution(format!("init feather spill writer: {e}")))?;
         Ok(Self {
-            path: path.to_string(),
+            final_path: path.to_string(),
             schema,
             key_col_index,
             value_col_indices,
-            buffered: Vec::new(),
+            temp,
+            writer,
+            keys: Vec::new(),
             last_key: None,
             input_sorted: true,
         })
     }
 
-    /// Project and buffer every row of `batch`. The key column is read from
-    /// `key_col_index`; value columns from `value_col_indices`, in order, into
-    /// schema fields 1.. . Type mismatches between the input columns and the
-    /// declared schema surface here (via `RecordBatch::try_new`).
+    /// Project and spill every row of `batch` (unsorted), recording each row's
+    /// key. Peak memory is O(one batch) plus the running key index.
     pub fn push_batch(&mut self, batch: &RecordBatch) -> DFResult<()> {
         let ncols = batch.num_columns();
         if self.key_col_index >= ncols {
@@ -344,17 +511,15 @@ impl FeatherSidecarBuilder {
                     .into(),
             ));
         }
-
-        // Track global sortedness while we have the keys in hand.
-        let keys = extract_keys_as_u64(key_col.as_ref())?;
-        for k in keys.into_iter().flatten() {
+        for k in extract_keys_as_u64(key_col.as_ref())?.into_iter().flatten() {
             if self.last_key.is_some_and(|prev| k < prev) {
                 self.input_sorted = false;
             }
             self.last_key = Some(k);
+            self.keys.push(k);
         }
 
-        // Project input columns into output-schema order: key first, then values.
+        // Project input columns to output-schema order: key first, then values.
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(self.value_col_indices.len() + 1);
         cols.push(batch.column(self.key_col_index).clone());
         for &ci in &self.value_col_indices {
@@ -362,108 +527,99 @@ impl FeatherSidecarBuilder {
         }
         let projected = RecordBatch::try_new(self.schema.clone(), cols)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        self.buffered.push(projected);
+        self.writer
+            .write(&projected)
+            .map_err(|e| DataFusionError::Execution(format!("spill feather batch: {e}")))?;
         Ok(())
     }
 
-    /// Whether every row pushed so far arrived in ascending key order (i.e. the
-    /// in-memory sort at `finish` was a no-op). Informational: feeds the
-    /// production decision on whether the DuckLake scan can be relied on to emit
-    /// sorted rowids (skipping the sort) or needs a merge step.
+    /// Whether every row arrived in ascending key order (i.e. the spill was
+    /// already sorted). Informational.
     pub fn input_was_sorted(&self) -> bool {
         self.input_sorted
     }
 
-    /// Sort buffered rows ascending by key, write them as a single Arrow IPC
-    /// batch to `path`, and open a [`FeatherLookupProvider`] over the result.
-    pub fn finish(self) -> DFResult<FeatherLookupProvider> {
-        let combined = if self.buffered.is_empty() {
-            RecordBatch::new_empty(self.schema.clone())
-        } else {
-            compute::concat_batches(&self.schema, &self.buffered)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
-        };
+    /// Sort by key and write the final sorted `.feather`, then open a provider
+    /// over it. Bounded memory: argsort the key index, then gather rows from the
+    /// mmap'd spill via `interleave` in `BUILD_CHUNK_ROWS` chunks.
+    pub fn finish(mut self) -> DFResult<FeatherLookupProvider> {
+        self.writer
+            .finish()
+            .map_err(|e| DataFusionError::Execution(format!("finalize feather spill: {e}")))?;
 
-        // Sort ascending by the key column (field 0), in the SAME u64 domain the
-        // lookup uses — `extract_keys_as_u64` casts the key `as u64`, and
-        // `fetch_by_keys`/`from_batches` binary-search and verify in u64 order. A
-        // raw `sort_to_indices` would instead order by the column's native (for
-        // Int64/Int32: signed) order, which disagrees with the u64 search for
-        // keys whose i64 and u64 orderings differ (e.g. negative Int64 values),
-        // making `from_batches` reject a genuinely-ascending build as "corrupt".
-        // Argsorting the u64-cast keys keeps the on-disk order, the open()-time
-        // verification, and the search consistent for every supported key type.
-        let sorted = if combined.num_rows() == 0 {
-            combined
-        } else {
-            let key_vals = key_column_as_u64(combined.column(0).as_ref())?;
-            let mut order: Vec<u32> = (0..key_vals.len() as u32).collect();
-            order.sort_by_key(|&i| key_vals[i as usize]);
-            let indices = UInt32Array::from(order);
-            sort_batch(&combined, &indices)?
-        };
+        let n = self.keys.len();
+        // Stable argsort of the keys (u64 domain), then reject any duplicate —
+        // strictly-ascending is the provider's invariant.
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_by_key(|&i| self.keys[i as usize]);
+        for w in order.windows(2) {
+            if self.keys[w[0] as usize] >= self.keys[w[1] as usize] {
+                return Err(DataFusionError::Execution(
+                    "FeatherSidecarBuilder: duplicate row key; keys must be unique".into(),
+                ));
+            }
+        }
 
-        write_ipc_file(&self.path, &sorted)?;
+        // mmap the unsorted spill; map global row position → (batch, local row).
+        let temp_path = self
+            .temp
+            .path()
+            .to_str()
+            .ok_or_else(|| DataFusionError::Execution("feather spill path is not UTF-8".into()))?
+            .to_string();
+        let (_tschema, tbatches, _tmmap) = mmap_feather(&temp_path)?;
+        let mut offsets: Vec<usize> = Vec::with_capacity(tbatches.len() + 1);
+        let mut acc = 0usize;
+        offsets.push(0);
+        for b in &tbatches {
+            acc += b.num_rows();
+            offsets.push(acc);
+        }
+
+        let final_file = File::create(&self.final_path).map_err(|e| {
+            DataFusionError::Execution(format!("create feather sidecar {}: {e}", self.final_path))
+        })?;
+        let mut out = arrow_ipc::writer::FileWriter::try_new(final_file, &self.schema)
+            .map_err(|e| DataFusionError::Execution(format!("init feather writer: {e}")))?;
+
+        let ncols = self.schema.fields().len();
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + BUILD_CHUNK_ROWS).min(n);
+            // (batch, local) pairs for this chunk, in sorted-key order.
+            let pairs: Vec<(usize, usize)> = order[start..end]
+                .iter()
+                .map(|&gp| {
+                    let gp = gp as usize;
+                    let b = offsets.partition_point(|&o| o <= gp) - 1;
+                    (b, gp - offsets[b])
+                })
+                .collect();
+            let cols: Vec<ArrayRef> = (0..ncols)
+                .map(|c| {
+                    let arrays: Vec<&dyn Array> =
+                        tbatches.iter().map(|b| b.column(c).as_ref()).collect();
+                    compute::interleave(&arrays, &pairs)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                })
+                .collect::<DFResult<_>>()?;
+            let batch = RecordBatch::try_new(self.schema.clone(), cols)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            out.write(&batch)
+                .map_err(|e| DataFusionError::Execution(format!("write feather batch: {e}")))?;
+            start = end;
+        }
+        out.finish()
+            .map_err(|e| DataFusionError::Execution(format!("finalize feather sidecar: {e}")))?;
 
         tracing::info!(
             "Feather sidecar '{}' built: {} rows, input_already_sorted={}.",
-            self.path,
-            sorted.num_rows(),
+            self.final_path,
+            n,
             self.input_sorted,
         );
 
-        FeatherLookupProvider::from_batches(self.schema, vec![sorted])
+        // `self.temp` (the spill) is removed when it drops at end of scope.
+        FeatherLookupProvider::open(&self.final_path)
     }
-}
-
-/// Lift the key column into a contiguous `Vec<u64>`, erroring on a null key (row
-/// keys must be non-null). The `as u64` cast inside `extract_keys_as_u64` defines
-/// the single key-ordering domain this provider uses everywhere — the build sort,
-/// the open-time sortedness check, and the `fetch_by_keys` binary search.
-fn key_column_as_u64(col: &dyn Array) -> DFResult<Vec<u64>> {
-    extract_keys_as_u64(col)?
-        .into_iter()
-        .map(|k| {
-            k.ok_or_else(|| {
-                DataFusionError::Execution(
-                    "FeatherLookupProvider: key column has a null value; \
-                     row keys must be non-null"
-                        .into(),
-                )
-            })
-        })
-        .collect()
-}
-
-/// `take` every column of `batch` by `indices`, preserving the schema.
-fn sort_batch(batch: &RecordBatch, indices: &UInt32Array) -> DFResult<RecordBatch> {
-    let cols: Vec<ArrayRef> = batch
-        .columns()
-        .iter()
-        .map(|c| {
-            compute::take(c.as_ref(), indices, None)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-        })
-        .collect::<DFResult<_>>()?;
-    RecordBatch::try_new(batch.schema(), cols)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-}
-
-/// Write a single batch as an Arrow IPC *file* (Feather v2). Uncompressed: the
-/// fast path needs on-disk bytes == in-memory layout (zero-copy take), and IPC
-/// whole-buffer compression would force a full-column decode per scattered row.
-fn write_ipc_file(path: &str, batch: &RecordBatch) -> DFResult<()> {
-    let file = std::fs::File::create(path)
-        .map_err(|e| DataFusionError::Execution(format!("create feather sidecar {path}: {e}")))?;
-    let mut writer = arrow_ipc::writer::FileWriter::try_new(file, &batch.schema())
-        .map_err(|e| DataFusionError::Execution(format!("init feather writer {path}: {e}")))?;
-    if batch.num_rows() > 0 {
-        writer
-            .write(batch)
-            .map_err(|e| DataFusionError::Execution(format!("write feather batch {path}: {e}")))?;
-    }
-    writer
-        .finish()
-        .map_err(|e| DataFusionError::Execution(format!("finalize feather sidecar {path}: {e}")))?;
-    Ok(())
 }

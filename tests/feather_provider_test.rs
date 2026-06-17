@@ -805,3 +805,59 @@ async fn table_provider_scan_roundtrips() {
         "projected scan returns only 2 columns"
     );
 }
+
+// ── Multi-batch (spill-sort + coarse-index) ─────────────────────────────────────
+
+/// Build > BUILD_CHUNK_ROWS rows from fully-unsorted input so the spill-sort runs
+/// and the final file is multi-batch, then check fetch parity vs SQLite — with
+/// keys straddling the internal batch boundary to exercise the coarse index +
+/// cross-batch gather.
+#[cfg(feature = "sqlite-provider")]
+#[tokio::test]
+async fn parity_multibatch_shuffled_build() {
+    let dir = tempdir().unwrap();
+    let (schema, batches, rowids) = gen_payload(20_000, 1024, 0xABCD);
+
+    // Feather: push batches reversed + each batch's rows reversed → spill is fully
+    // unsorted, forcing the external sort to do real work.
+    let fpath = dir.path().join("mb.feather");
+    let value_cols: Vec<usize> = (1..schema.fields().len()).collect();
+    let mut fb =
+        FeatherSidecarBuilder::begin(fpath.to_str().unwrap(), schema.clone(), 0, value_cols)
+            .unwrap();
+    for b in batches.iter().rev() {
+        fb.push_batch(&reverse_rows(b)).unwrap();
+    }
+    assert!(!fb.input_was_sorted(), "reversed input should report unsorted");
+    let feather = fb.finish().unwrap();
+    assert_eq!(feather.len(), rowids.len());
+
+    // SQLite oracle (order-independent B-tree).
+    let sqlite = build_sqlite(&dir, schema.clone(), &batches);
+
+    let n = rowids.len();
+    let mut rng = Rng(7);
+    let mut keys: Vec<u64> = (0..1500)
+        .map(|_| rowids[rng.below(n as u64) as usize] as u64)
+        .collect();
+    // Straddle the first internal batch boundary (sorted chunk size 8192).
+    for &i in &[0usize, 8191, 8192, 8193, n - 1] {
+        keys.push(rowids[i] as u64);
+    }
+
+    let f = feather.fetch_by_keys(&keys, "rowid", None).await.unwrap();
+    let s = sqlite.fetch_by_keys(&keys, "rowid", None).await.unwrap();
+    assert_eq!(fmt(&f), fmt(&s), "multi-batch shuffled-build parity mismatch");
+
+    // Projected fetch across the boundary too.
+    let proj = vec![0usize, 3, 6];
+    let f = feather
+        .fetch_by_keys(&keys, "rowid", Some(&proj))
+        .await
+        .unwrap();
+    let s = sqlite
+        .fetch_by_keys(&keys, "rowid", Some(&proj))
+        .await
+        .unwrap();
+    assert_eq!(fmt(&f), fmt(&s), "multi-batch projected parity mismatch");
+}
