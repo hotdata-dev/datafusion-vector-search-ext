@@ -16,19 +16,26 @@
 //     (`FileDecoder` over a `Buffer` backed by the mapping), so column buffers
 //     point into the mapped file. `take` over scattered keys faults in only the
 //     touched pages; only the small K-row output is heap-allocated. Resident
-//     payload memory is bounded by the working set, not the file size.
+//     *heap* is bounded by the working set, not the file size (open() does page
+//     in the key column once to validate ordering, but those are file-backed,
+//     reclaimable pages, not heap).
 //
 //   * BUILD: a bounded-memory external (spill) sort. Rows stream UNSORTED to a
-//     temp IPC file (O(one batch) payload resident); only an O(N)·8 B key index
-//     is kept in memory. At `finish` the keys are argsorted and the rows are
-//     gathered in sorted order from the mmap'd temp via `interleave`, in bounded
-//     chunks, into the final sorted file. No full-payload buffering, and no
-//     assumption about the input scan's row order.
+//     temp IPC file (O(one batch) payload resident); the only O(N) in-memory
+//     state is the key index — `u64` keys plus, at `finish`, a `usize` sort
+//     permutation (key-index bytes, not payload). At `finish` the keys are
+//     argsorted and the rows are gathered in sorted order from the mmap'd temp
+//     via `interleave`, in bounded chunks, into a temp file that is atomically
+//     renamed into place. No full-payload buffering, and no assumption about the
+//     input scan's row order.
 //
 // Because the payload is stored verbatim Arrow, there is zero type conversion:
 // Decimal / Struct / Map / FixedSizeList / Dictionary / Timestamp(tz) / nested
 // List all round-trip losslessly (unlike the SQLite provider, which rejects or
-// coerces them).
+// coerces them). One caveat for `Dictionary` payload columns: the IPC writer
+// requires a consistent dictionary across the spilled batches, so a build whose
+// input batches carry *different* dictionaries for the same column is rejected
+// at build time rather than silently corrupted.
 
 use std::any::Any;
 use std::fmt;
@@ -88,6 +95,14 @@ fn mmap_feather(path: &str) -> DFResult<(SchemaRef, Vec<RecordBatch>, Buffer)> {
         DataFusionError::Execution(format!("feather sidecar {path}: bad IPC trailer"))
     })?)
     .map_err(|e| DataFusionError::Execution(format!("feather sidecar {path}: {e}")))?;
+    // `read_footer_length` only validates the trailing magic, not that the footer
+    // fits in the file. Guard the subtraction so a corrupt length returns an error
+    // instead of underflowing/panicking on the slice.
+    if footer_len > trailer_start {
+        return Err(DataFusionError::Execution(format!(
+            "feather sidecar {path}: footer length {footer_len} exceeds file size"
+        )));
+    }
     let footer = root_as_footer(&buffer[trailer_start - footer_len..trailer_start])
         .map_err(|e| DataFusionError::Execution(format!("feather sidecar {path}: {e}")))?;
 
@@ -95,10 +110,27 @@ fn mmap_feather(path: &str) -> DFResult<(SchemaRef, Vec<RecordBatch>, Buffer)> {
         DataFusionError::Execution(format!("feather sidecar {path}: footer has no schema"))
     })?));
 
+    // A block's [offset, offset+meta+body) must lie within the file; otherwise
+    // `Buffer::slice_with_length` panics. Validate before slicing so corrupt
+    // offsets surface as a typed error.
+    let block_range = |offset: i64, meta: i32, body: i64| -> DFResult<(usize, usize)> {
+        let block_len = i64::from(meta).checked_add(body).filter(|&l| l >= 0);
+        let end = block_len.and_then(|l| offset.checked_add(l));
+        match (offset >= 0, block_len, end) {
+            (true, Some(l), Some(e)) if (e as u64) <= len as u64 => {
+                Ok((offset as usize, l as usize))
+            }
+            _ => Err(DataFusionError::Execution(format!(
+                "feather sidecar {path}: corrupt IPC block offset/length"
+            ))),
+        }
+    };
+
     let mut decoder = FileDecoder::new(schema.clone(), footer.version());
     for block in footer.dictionaries().iter().flatten() {
-        let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
-        let data = buffer.slice_with_length(block.offset() as usize, block_len);
+        let (off, block_len) =
+            block_range(block.offset(), block.metaDataLength(), block.bodyLength())?;
+        let data = buffer.slice_with_length(off, block_len);
         decoder
             .read_dictionary(block, &data)
             .map_err(|e| DataFusionError::Execution(format!("feather sidecar {path}: {e}")))?;
@@ -107,8 +139,9 @@ fn mmap_feather(path: &str) -> DFResult<(SchemaRef, Vec<RecordBatch>, Buffer)> {
     let mut batches = Vec::new();
     if let Some(record_batches) = footer.recordBatches() {
         for block in record_batches {
-            let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
-            let data = buffer.slice_with_length(block.offset() as usize, block_len);
+            let (off, block_len) =
+                block_range(block.offset(), block.metaDataLength(), block.bodyLength())?;
+            let data = buffer.slice_with_length(off, block_len);
             if let Some(batch) = decoder
                 .read_record_batch(block, &data)
                 .map_err(|e| DataFusionError::Execution(format!("feather sidecar {path}: {e}")))?
@@ -549,11 +582,12 @@ impl FeatherSidecarBuilder {
 
         let n = self.keys.len();
         // Stable argsort of the keys (u64 domain), then reject any duplicate —
-        // strictly-ascending is the provider's invariant.
-        let mut order: Vec<u32> = (0..n as u32).collect();
-        order.sort_by_key(|&i| self.keys[i as usize]);
+        // strictly-ascending is the provider's invariant. `usize` indices avoid a
+        // truncation ceiling on the row count.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| self.keys[i]);
         for w in order.windows(2) {
-            if self.keys[w[0] as usize] >= self.keys[w[1] as usize] {
+            if self.keys[w[0]] >= self.keys[w[1]] {
                 return Err(DataFusionError::Execution(
                     "FeatherSidecarBuilder: duplicate row key; keys must be unique".into(),
                 ));
@@ -576,10 +610,24 @@ impl FeatherSidecarBuilder {
             offsets.push(acc);
         }
 
-        let final_file = File::create(&self.final_path).map_err(|e| {
-            DataFusionError::Execution(format!("create feather sidecar {}: {e}", self.final_path))
-        })?;
-        let mut out = arrow_ipc::writer::FileWriter::try_new(final_file, &self.schema)
+        // Write to a sibling temp file and atomically rename into place, so a
+        // concurrent reader's live mmap of an existing sidecar keeps pointing at
+        // the old (now-unlinked) inode rather than observing a truncated file
+        // (SIGBUS / torn reads). Also gives crash-safety: a half-written build
+        // never leaves a corrupt sidecar at `final_path`.
+        let final_dir = std::path::Path::new(&self.final_path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let out_tmp = tempfile::Builder::new()
+            .prefix(".feather-build-")
+            .tempfile_in(&final_dir)
+            .map_err(|e| DataFusionError::Execution(format!("create feather output temp: {e}")))?;
+        let out_handle = out_tmp
+            .reopen()
+            .map_err(|e| DataFusionError::Execution(format!("open feather output temp: {e}")))?;
+        let mut out = arrow_ipc::writer::FileWriter::try_new(out_handle, &self.schema)
             .map_err(|e| DataFusionError::Execution(format!("init feather writer: {e}")))?;
 
         let ncols = self.schema.fields().len();
@@ -590,7 +638,6 @@ impl FeatherSidecarBuilder {
             let pairs: Vec<(usize, usize)> = order[start..end]
                 .iter()
                 .map(|&gp| {
-                    let gp = gp as usize;
                     let b = offsets.partition_point(|&o| o <= gp) - 1;
                     (b, gp - offsets[b])
                 })
@@ -611,6 +658,11 @@ impl FeatherSidecarBuilder {
         }
         out.finish()
             .map_err(|e| DataFusionError::Execution(format!("finalize feather sidecar: {e}")))?;
+
+        // Atomic publish: rename the completed temp over the final path.
+        out_tmp.persist(&self.final_path).map_err(|e| {
+            DataFusionError::Execution(format!("publish feather sidecar {}: {e}", self.final_path))
+        })?;
 
         tracing::info!(
             "Feather sidecar '{}' built: {} rows, input_already_sorted={}.",

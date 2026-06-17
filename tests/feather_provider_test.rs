@@ -828,7 +828,10 @@ async fn parity_multibatch_shuffled_build() {
     for b in batches.iter().rev() {
         fb.push_batch(&reverse_rows(b)).unwrap();
     }
-    assert!(!fb.input_was_sorted(), "reversed input should report unsorted");
+    assert!(
+        !fb.input_was_sorted(),
+        "reversed input should report unsorted"
+    );
     let feather = fb.finish().unwrap();
     assert_eq!(feather.len(), rowids.len());
 
@@ -847,7 +850,11 @@ async fn parity_multibatch_shuffled_build() {
 
     let f = feather.fetch_by_keys(&keys, "rowid", None).await.unwrap();
     let s = sqlite.fetch_by_keys(&keys, "rowid", None).await.unwrap();
-    assert_eq!(fmt(&f), fmt(&s), "multi-batch shuffled-build parity mismatch");
+    assert_eq!(
+        fmt(&f),
+        fmt(&s),
+        "multi-batch shuffled-build parity mismatch"
+    );
 
     // Projected fetch across the boundary too.
     let proj = vec![0usize, 3, 6];
@@ -860,4 +867,135 @@ async fn parity_multibatch_shuffled_build() {
         .await
         .unwrap();
     assert_eq!(fmt(&f), fmt(&s), "multi-batch projected parity mismatch");
+}
+
+// ── Regression + edge cases for the mmap + spill-sort rewrite ────────────────────
+
+/// `open` must return an error (not panic) on a file whose IPC trailer claims a
+/// footer larger than the file — the corrupt-footer guard.
+#[test]
+fn open_rejects_corrupt_footer_length() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("badfooter.feather");
+    // 32 bytes: padding, then a valid 10-byte trailer [footer_len i32 LE][b"ARROW1"]
+    // with an oversized footer_len.
+    let mut bytes = vec![0u8; 22];
+    bytes.extend_from_slice(&1_000_000_i32.to_le_bytes());
+    bytes.extend_from_slice(b"ARROW1");
+    std::fs::write(&p, &bytes).unwrap();
+    assert!(
+        FeatherLookupProvider::open(p.to_str().unwrap()).is_err(),
+        "oversized footer_len must error, not panic"
+    );
+}
+
+/// A build with zero pushed rows yields a valid, empty, re-openable sidecar.
+#[tokio::test]
+async fn empty_build_is_valid() {
+    let dir = tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let p = dir.path().join("empty.feather");
+    let builder = FeatherSidecarBuilder::begin(p.to_str().unwrap(), schema, 0, vec![1]).unwrap();
+    let provider = builder.finish().unwrap();
+    assert!(provider.is_empty());
+    assert!(
+        provider
+            .fetch_by_keys(&[1, 2, 3], "rowid", None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let reopened = FeatherLookupProvider::open(p.to_str().unwrap()).unwrap();
+    assert_eq!(reopened.len(), 0);
+}
+
+/// Single-row build (smallest non-empty case).
+#[tokio::test]
+async fn single_row_build() {
+    let dir = tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![42_i64])),
+            Arc::new(StringArray::from(vec![Some("answer")])),
+        ],
+    )
+    .unwrap();
+    let p = dir.path().join("one.feather");
+    let mut b = FeatherSidecarBuilder::begin(p.to_str().unwrap(), schema, 0, vec![1]).unwrap();
+    b.push_batch(&batch).unwrap();
+    let provider = b.finish().unwrap();
+    assert_eq!(provider.len(), 1);
+    let out = provider.fetch_by_keys(&[42], "rowid", None).await.unwrap();
+    assert_eq!(out[0].num_rows(), 1);
+    assert!(
+        provider
+            .fetch_by_keys(&[7], "rowid", None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Build exactly 2× BUILD_CHUNK_ROWS (16384) rows so the gather hits an exact
+/// chunk boundary, and check parity vs SQLite for keys straddling it.
+#[cfg(feature = "sqlite-provider")]
+#[tokio::test]
+async fn build_at_exact_chunk_boundary() {
+    let dir = tempdir().unwrap();
+    let (schema, batches, rowids) = gen_payload(16_384, 4096, 0xBEEF);
+    let feather = build_feather(&dir, schema.clone(), &batches);
+    let sqlite = build_sqlite(&dir, schema.clone(), &batches);
+    assert_eq!(feather.len(), 16_384);
+
+    let mut keys: Vec<u64> = [0usize, 8191, 8192, 8193, 16_383]
+        .iter()
+        .map(|&i| rowids[i] as u64)
+        .collect();
+    let mut rng = Rng(1);
+    for _ in 0..500 {
+        keys.push(rowids[rng.below(16_384) as usize] as u64);
+    }
+    let f = feather.fetch_by_keys(&keys, "rowid", None).await.unwrap();
+    let s = sqlite.fetch_by_keys(&keys, "rowid", None).await.unwrap();
+    assert_eq!(fmt(&f), fmt(&s), "chunk-boundary parity mismatch");
+}
+
+/// Duplicate keys split across separate push_batch calls must be rejected at
+/// finish (the dup check runs over the global sorted order, not per-batch).
+#[test]
+fn duplicate_keys_across_pushes_rejected() {
+    let dir = tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let mk = |rid: Vec<i64>, names: Vec<&'static str>| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(rid)),
+                Arc::new(StringArray::from(
+                    names.into_iter().map(Some).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    };
+    let p = dir.path().join("dup.feather");
+    let mut b =
+        FeatherSidecarBuilder::begin(p.to_str().unwrap(), schema.clone(), 0, vec![1]).unwrap();
+    b.push_batch(&mk(vec![1, 2], vec!["a", "b"])).unwrap();
+    b.push_batch(&mk(vec![2, 3], vec!["c", "d"])).unwrap(); // key 2 duplicated across pushes
+    assert!(
+        b.finish().is_err(),
+        "duplicate key across pushes must be rejected"
+    );
 }
