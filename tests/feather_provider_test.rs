@@ -17,7 +17,7 @@ use arrow_array::builder::{FixedSizeListBuilder, Float64Builder, ListBuilder};
 use arrow_array::types::Int32Type;
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, DictionaryArray, Int64Array, RecordBatch, StringArray,
-    StructArray, TimestampMicrosecondArray,
+    StructArray, TimestampMicrosecondArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::util::pretty::pretty_format_batches;
@@ -607,4 +607,201 @@ async fn footprint_and_build_time_vs_sqlite() {
 
     // Sanity only (not a perf gate): both files exist and are non-trivial.
     assert!(feather_bytes > 0 && sqlite_bytes > 0);
+}
+
+// ── open() error paths & robustness ─────────────────────────────────────────────
+
+/// Write a batch to a `.feather` file directly (bypassing the builder's sort), so
+/// we can construct deliberately-malformed sidecars for the rejection tests.
+fn write_raw_feather(path: &str, batch: &RecordBatch) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut w = arrow_ipc::writer::FileWriter::try_new(file, &batch.schema()).unwrap();
+    w.write(batch).unwrap();
+    w.finish().unwrap();
+}
+
+/// `open` must fail loudly (not silently return wrong rows) when the stored key
+/// column is not strictly ascending — both the unsorted and duplicate-key cases.
+/// This guards the "fail at open, not at query time" contract the binary search
+/// depends on.
+#[test]
+fn open_rejects_unsorted_or_duplicate_keys() {
+    let dir = tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+
+    let unsorted = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![10_i64, 3, 1])),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("c")])),
+        ],
+    )
+    .unwrap();
+    let p1 = dir.path().join("unsorted.feather");
+    write_raw_feather(p1.to_str().unwrap(), &unsorted);
+    assert!(
+        FeatherLookupProvider::open(p1.to_str().unwrap()).is_err(),
+        "descending key column must be rejected"
+    );
+
+    // Duplicate keys must also be rejected (mirrors SQLite's INTEGER PRIMARY KEY).
+    let dup = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 1, 2])),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("c")])),
+        ],
+    )
+    .unwrap();
+    let p2 = dir.path().join("dup.feather");
+    write_raw_feather(p2.to_str().unwrap(), &dup);
+    assert!(
+        FeatherLookupProvider::open(p2.to_str().unwrap()).is_err(),
+        "duplicate keys must be rejected"
+    );
+}
+
+/// `open` returns an error (never panics) on a non-Arrow file and on a missing
+/// file, rather than surfacing a corrupt provider.
+#[test]
+fn open_rejects_malformed_or_missing_file() {
+    let dir = tempdir().unwrap();
+    let garbage = dir.path().join("garbage.feather");
+    std::fs::write(&garbage, b"this is not an arrow ipc file").unwrap();
+    assert!(FeatherLookupProvider::open(garbage.to_str().unwrap()).is_err());
+
+    let missing = dir.path().join("does_not_exist.feather");
+    assert!(FeatherLookupProvider::open(missing.to_str().unwrap()).is_err());
+}
+
+/// Regression for the build-sort domain fix: a genuinely-ascending Int64 key
+/// column containing negative values must BUILD (not be rejected as "corrupt")
+/// and round-trip via the u64 lookup domain the engine uses for rowids. Before
+/// the fix, `finish()` sorted by signed Arrow order while the verify/search used
+/// u64 order, so this input was spuriously rejected.
+#[tokio::test]
+async fn signed_negative_keys_build_and_query() {
+    let dir = tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![-5_i64, -1, 3, 10])),
+            Arc::new(StringArray::from(vec![
+                Some("neg5"),
+                Some("neg1"),
+                Some("three"),
+                Some("ten"),
+            ])),
+        ],
+    )
+    .unwrap();
+    let path = dir.path().join("neg.feather");
+    let mut b = FeatherSidecarBuilder::begin(path.to_str().unwrap(), schema, 0, vec![1]).unwrap();
+    b.push_batch(&batch).unwrap();
+    let provider = b
+        .finish()
+        .expect("negative-but-ascending Int64 keys must build");
+
+    // The engine passes rowids as u64; a negative i64 arrives as its u64 reinterpretation.
+    let out = provider
+        .fetch_by_keys(&[(-5_i64) as u64, 3], "rowid", None)
+        .await
+        .unwrap();
+    let names: Vec<String> = out
+        .iter()
+        .flat_map(|bch| {
+            bch.column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .map(|s| s.to_string())
+        })
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&"neg5".to_string()) && names.contains(&"three".to_string()));
+}
+
+/// UInt64 key column (the other common rowid type) round-trips. Only Int64 was
+/// covered before; this exercises the UInt64 arm of `extract_keys_as_u64`.
+#[tokio::test]
+async fn uint64_keys_roundtrip() {
+    let dir = tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rowid", DataType::UInt64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![5_u64, 50, 500, 5000])),
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("b"),
+                Some("c"),
+                Some("d"),
+            ])),
+        ],
+    )
+    .unwrap();
+    let path = dir.path().join("u64.feather");
+    let mut b = FeatherSidecarBuilder::begin(path.to_str().unwrap(), schema, 0, vec![1]).unwrap();
+    b.push_batch(&batch).unwrap();
+    let provider = b.finish().unwrap();
+
+    let out = provider
+        .fetch_by_keys(&[50, 5000], "rowid", None)
+        .await
+        .unwrap();
+    let names: Vec<String> = out[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .flatten()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(names, vec!["b".to_string(), "d".to_string()]);
+}
+
+/// The `TableProvider::scan` path (used for SQL column-name resolution) actually
+/// returns rows — a working MemTable scan, unlike the parquet sibling which is
+/// NotImplemented. Guards against the silent zero-row scan that bit parquet.
+#[tokio::test]
+async fn table_provider_scan_roundtrips() {
+    use datafusion::catalog::TableProvider;
+    use datafusion::prelude::SessionContext;
+
+    let dir = tempdir().unwrap();
+    let (schema, batches, _rowids) = gen_payload(300, 128, 21);
+    let provider = build_feather(&dir, schema, &batches);
+    let n = provider.len();
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(provider) as Arc<dyn TableProvider>)
+        .unwrap();
+
+    let all = ctx
+        .sql("SELECT rowid, title FROM t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = all.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, n, "full scan should see every row");
+    assert_eq!(
+        all[0].num_columns(),
+        2,
+        "projected scan returns only 2 columns"
+    );
 }
