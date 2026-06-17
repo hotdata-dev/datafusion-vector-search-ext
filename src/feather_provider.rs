@@ -18,10 +18,10 @@
 // `sql_values_to_arrow` on read, and no rejection/coercion of Decimal / Struct /
 // Map / FixedSizeList / Dictionary / Timestamp(tz) / nested List.
 //
-// Scope: this is the PoC primitive (ticket #702). The whole file is read into
-// memory once at open and held resident (the "expand to uncompressed on NVMe
-// before querying" model). mmap demand-paging and a coarse per-batch index for
-// multi-GB sidecars are documented follow-ups, not implemented here.
+// Scope: the whole file is read into memory once at open and held resident (the
+// "expand to uncompressed on NVMe before querying" model). mmap demand-paging and
+// a coarse per-batch index for multi-GB sidecars are follow-ups, not implemented
+// here.
 
 use std::any::Any;
 use std::fmt;
@@ -112,26 +112,19 @@ impl FeatherLookupProvider {
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
         };
 
-        let keys: Vec<u64> = extract_keys_as_u64(batch.column(0).as_ref())?
-            .into_iter()
-            .map(|k| {
-                k.ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "FeatherLookupProvider: key column has a null value; \
-                         row keys must be non-null"
-                            .into(),
-                    )
-                })
-            })
-            .collect::<DFResult<_>>()?;
+        let keys: Vec<u64> = key_column_as_u64(batch.column(0).as_ref())?;
 
-        // Binary search requires ascending keys. The builder guarantees this;
-        // verify defensively so a bad file fails loudly at open, not silently
-        // at query time with wrong rows.
-        if keys.windows(2).any(|w| w[0] > w[1]) {
+        // Binary search requires strictly-ascending keys: ascending so
+        // `partition_point` is valid, and unique so a key maps to one physical
+        // row (mirroring SQLite's `INTEGER PRIMARY KEY`, which rejects duplicate
+        // keys at build). The builder guarantees this; verify defensively so a
+        // bad file fails loudly at open, not silently at query time with wrong
+        // rows. Compared in u64 order to match the build sort and the search.
+        if keys.windows(2).any(|w| w[0] >= w[1]) {
             return Err(DataFusionError::Execution(format!(
-                "FeatherLookupProvider: key column '{key_col}' is not sorted ascending; \
-                 the sidecar is corrupt or was not built by FeatherSidecarBuilder"
+                "FeatherLookupProvider: key column '{key_col}' is not strictly ascending \
+                 (unsorted or duplicate keys); the sidecar is corrupt or was not built by \
+                 FeatherSidecarBuilder"
             )));
         }
 
@@ -268,8 +261,8 @@ impl TableProvider for FeatherLookupProvider {
 /// whether a bounded-memory merge (instead of the in-memory sort) is needed at
 /// production scale.
 ///
-/// **Memory:** the PoC buffers all projected rows before sorting — O(N) resident.
-/// A bounded-memory external merge-of-sorted-runs is the documented scale plan;
+/// **Memory:** the builder buffers all projected rows before sorting — O(N)
+/// resident. A bounded-memory external merge-of-sorted-runs is the scale plan;
 /// it is not implemented here.
 ///
 /// The first field of `schema` is the key column; fields 1.. are the stored
@@ -391,13 +384,22 @@ impl FeatherSidecarBuilder {
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
         };
 
-        // Sort ascending by the key column (field 0). Always performed so the
-        // file is sorted regardless of input order; cheap when already sorted.
+        // Sort ascending by the key column (field 0), in the SAME u64 domain the
+        // lookup uses — `extract_keys_as_u64` casts the key `as u64`, and
+        // `fetch_by_keys`/`from_batches` binary-search and verify in u64 order. A
+        // raw `sort_to_indices` would instead order by the column's native (for
+        // Int64/Int32: signed) order, which disagrees with the u64 search for
+        // keys whose i64 and u64 orderings differ (e.g. negative Int64 values),
+        // making `from_batches` reject a genuinely-ascending build as "corrupt".
+        // Argsorting the u64-cast keys keeps the on-disk order, the open()-time
+        // verification, and the search consistent for every supported key type.
         let sorted = if combined.num_rows() == 0 {
             combined
         } else {
-            let indices = compute::sort_to_indices(combined.column(0).as_ref(), None, None)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let key_vals = key_column_as_u64(combined.column(0).as_ref())?;
+            let mut order: Vec<u32> = (0..key_vals.len() as u32).collect();
+            order.sort_by_key(|&i| key_vals[i as usize]);
+            let indices = UInt32Array::from(order);
             sort_batch(&combined, &indices)?
         };
 
@@ -412,6 +414,25 @@ impl FeatherSidecarBuilder {
 
         FeatherLookupProvider::from_batches(self.schema, vec![sorted])
     }
+}
+
+/// Lift the key column into a contiguous `Vec<u64>`, erroring on a null key (row
+/// keys must be non-null). The `as u64` cast inside `extract_keys_as_u64` defines
+/// the single key-ordering domain this provider uses everywhere — the build sort,
+/// the open-time sortedness check, and the `fetch_by_keys` binary search.
+fn key_column_as_u64(col: &dyn Array) -> DFResult<Vec<u64>> {
+    extract_keys_as_u64(col)?
+        .into_iter()
+        .map(|k| {
+            k.ok_or_else(|| {
+                DataFusionError::Execution(
+                    "FeatherLookupProvider: key column has a null value; \
+                     row keys must be non-null"
+                        .into(),
+                )
+            })
+        })
+        .collect()
 }
 
 /// `take` every column of `batch` by `indices`, preserving the schema.
