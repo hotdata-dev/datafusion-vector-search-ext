@@ -65,6 +65,8 @@ pub mod rule;
 pub mod udf;
 pub mod udtf;
 
+#[cfg(feature = "feather-provider")]
+pub mod feather_provider;
 #[cfg(feature = "parquet-provider")]
 pub mod parquet_provider;
 #[cfg(feature = "sqlite-provider")]
@@ -82,6 +84,8 @@ pub use rule::USearchRule;
 pub use udf::{cosine_distance_udf, l2_distance_udf, negative_dot_product_udf};
 pub use udtf::VectorSearchVectorUDTF;
 
+#[cfg(feature = "feather-provider")]
+pub use feather_provider::{FeatherLookupProvider, FeatherSidecarBuilder};
 #[cfg(feature = "parquet-provider")]
 pub use parquet_provider::ParquetLookupProvider;
 #[cfg(feature = "sqlite-provider")]
