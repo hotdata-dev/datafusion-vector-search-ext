@@ -6,7 +6,6 @@
 // Returns all table columns plus `_distance: Float32`.
 // Requires a vector index on the specified column.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -109,10 +108,6 @@ impl fmt::Debug for VectorSearchVectorProvider {
 
 #[async_trait]
 impl TableProvider for VectorSearchVectorProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         // RegisteredTable.schema already includes all data columns + _distance
         self.registered.schema.clone()
@@ -232,9 +227,6 @@ impl DisplayAs for BatchExec {
 impl ExecutionPlan for BatchExec {
     fn name(&self) -> &str {
         "BatchExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties

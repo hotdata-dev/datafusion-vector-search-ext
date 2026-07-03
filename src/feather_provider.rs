@@ -37,7 +37,6 @@
 // input batches carry *different* dictionaries for the same column is rejected
 // at build time rather than silently corrupted.
 
-use std::any::Any;
 use std::fmt;
 use std::fs::File;
 use std::ptr::NonNull;
@@ -422,9 +421,6 @@ impl PointLookupProvider for FeatherLookupProvider {
 
 #[async_trait]
 impl TableProvider for FeatherLookupProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

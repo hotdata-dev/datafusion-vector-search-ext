@@ -13,7 +13,6 @@
 // subsequent runs. The first build reads all parquet files and inserts rows
 // inside a single transaction.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -554,9 +553,6 @@ fn execute_query_sync(
 
 #[async_trait]
 impl TableProvider for SqliteLookupProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -630,9 +626,6 @@ impl DisplayAs for SqliteFullScanExec {
 impl ExecutionPlan for SqliteFullScanExec {
     fn name(&self) -> &str {
         "SqliteFullScanExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties

@@ -5,7 +5,6 @@
 //
 // These are kept in this module alongside the UDTF and optimizer rule.
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -78,9 +77,6 @@ impl Hash for DistanceUDF {
 }
 
 impl ScalarUDFImpl for DistanceUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         &self.name
     }

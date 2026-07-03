@@ -3,7 +3,6 @@
 // No rg_map needed. Each usearch key directly encodes (file_idx, rg_idx, local_offset)
 // via pack_key / unpack_key. Decoding is O(1) bitwise — no binary search.
 
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -372,9 +371,6 @@ impl PointLookupProvider for ParquetLookupProvider {
 
 #[async_trait]
 impl datafusion::catalog::TableProvider for ParquetLookupProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

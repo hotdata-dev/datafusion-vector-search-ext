@@ -5,7 +5,6 @@
 // vector search extension.  HashKeyProvider is the bundled in-memory
 // implementation — suitable for tests and small datasets.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -214,9 +213,6 @@ impl PointLookupProvider for HashKeyProvider {
 
 #[async_trait]
 impl TableProvider for HashKeyProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
