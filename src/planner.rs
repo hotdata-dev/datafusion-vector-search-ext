@@ -27,7 +27,6 @@
 // The Sort node is kept in the logical plan so DataFusion handles ordering
 // by _distance / dist alias.
 
-use std::any::Any;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -298,9 +297,6 @@ impl DisplayAs for USearchExec {
 impl ExecutionPlan for USearchExec {
     fn name(&self) -> &str {
         "USearchExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties

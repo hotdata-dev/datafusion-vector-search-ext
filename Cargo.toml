@@ -12,7 +12,7 @@ feather-provider = ["dep:arrow-ipc", "dep:memmap2", "dep:tempfile"]
 
 [dependencies]
 tracing      = "0.1"
-datafusion   = "53"
+datafusion   = "54"
 usearch      = "2.24.0"
 arrow-array  = "58"
 arrow-schema = "58"
