@@ -64,13 +64,22 @@ impl USearchRule {
         match plan {
             // Anchor on the Sort itself. The projection (if any) sits *below* the
             // Sort and supplies its output columns; SELECT * omits it entirely.
+            // `peel_alias` skips over `SubqueryAlias` nodes introduced by clients
+            // that alias every table/subquery (e.g. ibis/SQLGlot), which
+            // DataFusion does not eliminate on its own.
             LogicalPlan::Sort(sort) => {
-                let (proj_exprs_slice, after_sort): (&[Expr], &LogicalPlan) =
-                    match sort.input.as_ref() {
-                        LogicalPlan::Projection(p) => (p.expr.as_slice(), p.input.as_ref()),
-                        other => (&[], other),
-                    };
-                self.build_rewrite(sort, proj_exprs_slice, after_sort)
+                let (sort_input, outer_alias) = peel_alias_capturing(sort.input.as_ref());
+                let (proj_exprs_slice, after_sort): (&[Expr], &LogicalPlan) = match sort_input {
+                    LogicalPlan::Projection(p) => (p.expr.as_slice(), peel_alias(p.input.as_ref())),
+                    other => (&[], other),
+                };
+                self.build_rewrite(
+                    plan.schema().as_ref(),
+                    outer_alias,
+                    sort,
+                    proj_exprs_slice,
+                    after_sort,
+                )
             }
 
             // Output-aware passthrough. When a Projection sits directly over a
@@ -95,11 +104,19 @@ impl USearchRule {
                 let LogicalPlan::Sort(sort) = outer.input.as_ref() else {
                     return None;
                 };
-                match sort.input.as_ref() {
+                // `peel_alias` skips over `SubqueryAlias` nodes (see the Sort
+                // arm above) so this shape also fires through aliased tables
+                // and subqueries.
+                let (sort_input, outer_alias) = peel_alias_capturing(sort.input.as_ref());
+                match sort_input {
                     // Passthrough shape: Sort rests directly on the scan.
-                    LogicalPlan::TableScan(_) | LogicalPlan::Filter(_) => {
-                        self.build_rewrite(sort, &outer.expr, sort.input.as_ref())
-                    }
+                    LogicalPlan::TableScan(_) | LogicalPlan::Filter(_) => self.build_rewrite(
+                        plan.schema().as_ref(),
+                        outer_alias,
+                        sort,
+                        &outer.expr,
+                        sort_input,
+                    ),
                     // Trimmed shape: `SELECT id … ORDER BY l2_distance(vec, …)`
                     // with the distance NOT in the SELECT list. DataFusion
                     // materializes the raw vector column in an intermediate
@@ -116,11 +133,17 @@ impl USearchRule {
                     // Sort visit handles it exactly as before.
                     LogicalPlan::Projection(inner)
                         if matches!(
-                            inner.input.as_ref(),
+                            peel_alias(inner.input.as_ref()),
                             LogicalPlan::TableScan(_) | LogicalPlan::Filter(_)
                         ) =>
                     {
-                        self.build_rewrite(sort, &outer.expr, inner.input.as_ref())
+                        self.build_rewrite(
+                            plan.schema().as_ref(),
+                            outer_alias,
+                            sort,
+                            &outer.expr,
+                            peel_alias(inner.input.as_ref()),
+                        )
                     }
                     _ => None,
                 }
@@ -132,6 +155,8 @@ impl USearchRule {
 
     fn build_rewrite(
         &self,
+        target_schema: &DFSchema,
+        outer_alias: Option<TableReference>,
         sort: &datafusion::logical_expr::logical_plan::Sort,
         proj_exprs_slice: &[Expr],
         after_sort: &LogicalPlan,
@@ -151,7 +176,7 @@ impl USearchRule {
                 table_name.clone(),
                 vec![],
             ),
-            LogicalPlan::Filter(f) => match f.input.as_ref() {
+            LogicalPlan::Filter(f) => match peel_alias(f.input.as_ref()) {
                 LogicalPlan::TableScan(TableScan { table_name, .. }) => (
                     table_ref_to_str(table_name),
                     table_name.table().to_string(),
@@ -263,7 +288,34 @@ impl USearchRule {
 
         let outer_proj_exprs = build_outer_projection(&final_proj_exprs);
         let outer_proj = Projection::try_new(outer_proj_exprs, Arc::new(sorted)).ok()?;
-        Some(LogicalPlan::Projection(outer_proj))
+        let mut result = LogicalPlan::Projection(outer_proj);
+
+        // Table-aliasing clients (ibis/SQLGlot) wrap the matched region in a
+        // `SubqueryAlias` (`t0`/`t1`/…) that `peel_alias` saw through above;
+        // its name was captured as `outer_alias`. Re-wrap the rewrite in that
+        // same alias so its exposed schema is qualified identically to
+        // `target_schema` — columns above resolved against the real
+        // `table_ref` (matching USearchNode's own schema), and `SubqueryAlias`
+        // is what re-qualifies an entire plan's output in one step, the same
+        // mechanism DataFusion itself uses to build `FROM t AS alias`.
+        if let Some(alias) = outer_alias {
+            result = LogicalPlan::SubqueryAlias(
+                datafusion::logical_expr::logical_plan::SubqueryAlias::try_new(
+                    Arc::new(result),
+                    alias,
+                )
+                .ok()?,
+            );
+        }
+
+        // Safety net: some alias placements (e.g. an alias on the scan with
+        // no outer wrap over the Sort) can leave the exposed schema still
+        // mismatched from `target_schema` — decline rather than hand
+        // DataFusion's post-rewrite invariant check a plan it will reject.
+        if result.schema().as_ref() != target_schema {
+            return None;
+        }
+        Some(result)
     }
 }
 
@@ -295,6 +347,38 @@ impl datafusion::optimizer::OptimizerRule for USearchRule {
             return Ok(Transformed::yes(new_plan));
         }
         Ok(Transformed::no(plan))
+    }
+}
+
+/// Skip over a chain of `SubqueryAlias` nodes to reach the plan they wrap.
+///
+/// Table-aliasing SQL clients (ibis/SQLGlot, and ORMs/BI tools generally)
+/// alias every table and wrap projections in subqueries, producing
+/// `SubqueryAlias` nodes that DataFusion does not eliminate on its own. The
+/// rule's structural matchers descend through `Projection`/`Filter` only, so
+/// callers route each child through this helper before matching against it.
+fn peel_alias(plan: &LogicalPlan) -> &LogicalPlan {
+    let mut p = plan;
+    while let LogicalPlan::SubqueryAlias(a) = p {
+        p = a.input.as_ref();
+    }
+    p
+}
+
+/// Like [`peel_alias`], but also returns the outermost alias name, if `plan`
+/// is itself directly a `SubqueryAlias` (or chain of them).
+///
+/// The outermost name is what the wrapped plan's columns are actually
+/// qualified with in the surrounding query — `SubqueryAlias` re-qualifies
+/// every field of its input uniformly, so a chain's inner alias names never
+/// surface past the outer one. Callers thread this back into
+/// [`USearchRule::build_rewrite`] to re-wrap the rewritten plan in the same
+/// alias, so its exposed schema matches what was there originally.
+fn peel_alias_capturing(plan: &LogicalPlan) -> (&LogicalPlan, Option<TableReference>) {
+    if let LogicalPlan::SubqueryAlias(a) = plan {
+        (peel_alias(a.input.as_ref()), Some(a.alias.clone()))
+    } else {
+        (plan, None)
     }
 }
 
@@ -511,6 +595,11 @@ fn remap_one(expr: &Expr, dist_alias_name: &str, table_ref: &TableReference) -> 
             .alias(a.name.as_str()),
             _ => col(a.name.as_str()),
         },
+        // Outer alias projection referencing the distance column by the name
+        // an inner subquery already aliased it to (e.g. ibis's
+        // `SELECT id, _distance FROM (SELECT …, dist(…) AS _distance …) AS
+        // t1`), rather than the raw distance UDF or an `Alias` wrapping it.
+        Expr::Column(c) if c.name == dist_alias_name => col("_distance").alias(c.name.as_str()),
         Expr::Column(c) => Expr::Column(datafusion::common::Column::new(
             Some(table_ref.clone()),
             c.name.as_str(),
