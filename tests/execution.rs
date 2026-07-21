@@ -314,6 +314,57 @@ async fn exec_qualified_where_order_by_alias() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Table-aliasing SQL clients (ibis/SQLGlot) — SubqueryAlias survives
+//
+// Unlike `exec_qualified_subquery_where_order_by_alias` above (where DataFusion
+// eliminates a trivial, unreferenced subquery alias on its own — confirmed by
+// running it against the pre-fix rule), the shape below is the one ibis
+// actually compiles to: verified against a live `ibis` 12.0.0
+// (`ibis.to_sql(expr, dialect="postgres")` on the `semantic_search` helper
+// sketched in hotdata-dlt-destination's vector-search-exploration.md). There,
+// the alias qualifier IS referenced downstream (`t1._distance`, `t0.vector`),
+// so DataFusion keeps both `SubqueryAlias` nodes — this is what USearchRule's
+// `peel_alias` sees through.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// The ibis-compiled shape verbatim: double `SubqueryAlias`, inner columns
+/// table-qualified, outer `SELECT *` referencing the alias in `ORDER BY`.
+#[tokio::test]
+async fn exec_ibis_shape_double_alias_returns_correct_neighbors() {
+    let ctx = make_exec_ctx("items::vector").await;
+    let sql = format!(
+        "SELECT * FROM (\
+            SELECT \"t0\".\"id\", \"t0\".\"label\", L2_DISTANCE(\"t0\".\"vector\", {Q}) AS \"_distance\" \
+            FROM \"items\" AS \"t0\"\
+         ) AS \"t1\" ORDER BY \"t1\".\"_distance\" ASC LIMIT 2"
+    );
+    let ids = collect_ids(&ctx, &sql).await;
+    assert_eq!(
+        ids[0], 1,
+        "closest to [1,0,0,0] must be row 1 through the aliased/ibis shape\nids: {ids:?}"
+    );
+}
+
+/// Same shape with a `WHERE` clause on the inner scan — the filter must still
+/// be absorbed into `USearchNode` (adaptive filtered search) through the alias.
+#[tokio::test]
+async fn exec_ibis_shape_double_alias_with_where_filters_correctly() {
+    let ctx = make_exec_ctx("items::vector").await;
+    let sql = format!(
+        "SELECT * FROM (\
+            SELECT \"t0\".\"id\", \"t0\".\"label\", L2_DISTANCE(\"t0\".\"vector\", {Q}) AS \"_distance\" \
+            FROM \"items\" AS \"t0\" WHERE \"t0\".\"label\" != 'alpha'\
+         ) AS \"t1\" ORDER BY \"t1\".\"_distance\" ASC LIMIT 2"
+    );
+    let ids = collect_ids(&ctx, &sql).await;
+    assert!(ids.contains(&2), "row 2 (beta) must appear; got {ids:?}");
+    assert!(
+        !ids.contains(&1),
+        "row 1 (alpha) must be filtered out; got {ids:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Registration validation
 // ═══════════════════════════════════════════════════════════════════════════════
 
